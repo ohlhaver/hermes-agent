@@ -138,8 +138,8 @@ class TestListJobs:
 
 class TestCreateJob:
     @pytest.mark.asyncio
-    async def test_create_job(self, adapter):
-        """POST /api/jobs with valid body returns created job."""
+    async def test_create_job_forwards_route(self, adapter):
+        """POST /api/jobs forwards an optional provider/model route."""
         app = _create_app(adapter)
         mock_create = MagicMock(return_value=SAMPLE_JOB)
         async with TestClient(TestServer(app)) as cli:
@@ -152,6 +152,8 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                    "provider": "openrouter",
+                    "model": "deepseek/deepseek-v4-flash-0731",
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -164,6 +166,8 @@ class TestCreateJob:
                 assert call_kwargs["name"] == "test-job"
                 assert call_kwargs["schedule"] == "*/5 * * * *"
                 assert call_kwargs["prompt"] == "do something"
+                assert call_kwargs["provider"] == "openrouter"
+                assert call_kwargs["model"] == "deepseek/deepseek-v4-flash-0731"
                 assert call_kwargs["origin"]["platform"] == "api_server"
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"

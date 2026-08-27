@@ -4165,6 +4165,8 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            provider = body.get("provider")
+            model = body.get("model")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -4184,6 +4186,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            for field, value in (("provider", provider), ("model", model)):
+                if value is not None and (not isinstance(value, str) or not value.strip()):
+                    return web.json_response(
+                        {"error": f"{field.capitalize()} must be a non-empty string"}, status=400,
+                    )
 
             kwargs = {
                 "prompt": prompt,
@@ -4196,6 +4203,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if provider is not None:
+                kwargs["provider"] = provider
+            if model is not None:
+                kwargs["model"] = model
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
