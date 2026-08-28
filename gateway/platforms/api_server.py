@@ -4107,7 +4107,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled",
+        "provider", "model",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -4250,6 +4253,13 @@ class APIServerAdapter(BasePlatformAdapter):
             sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
+            for field in ("provider", "model"):
+                if field in sanitized:
+                    value = sanitized[field]
+                    if value is not None and (not isinstance(value, str) or not value.strip()):
+                        return web.json_response(
+                            {"error": f"{field.capitalize()} must be a non-empty string"}, status=400,
+                        )
             # Validate lengths if present
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
                 return web.json_response(

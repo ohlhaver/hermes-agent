@@ -242,6 +242,38 @@ class TestCreateJobSnapshot:
         assert job["model"] == "my-model"
         assert job["model_snapshot"] is None
 
+    def test_update_to_pinned_route_clears_inference_snapshots(self, monkeypatch, tmp_path):
+        """An explicit update route replaces stale unpinned snapshots."""
+        jobs = self._isolate_storage(monkeypatch)
+        (tmp_path / "config.yaml").write_text("model:\n  default: old-model\n")
+        monkeypatch.setattr(
+            "cron.jobs.get_hermes_home", lambda: tmp_path, raising=True
+        )
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={"provider": "old-provider"},
+        ):
+            existing = jobs.create_job(prompt="do a thing", schedule="every 1 hour")
+
+        stored = [existing]
+        monkeypatch.setattr(jobs, "load_jobs", lambda: stored, raising=True)
+        monkeypatch.setattr(
+            jobs,
+            "save_jobs",
+            lambda value: stored.__setitem__(slice(None), value),
+            raising=True,
+        )
+
+        updated = jobs.update_job(existing["id"], {
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash-0731",
+        })
+
+        assert updated["provider"] == "openrouter"
+        assert updated["model"] == "deepseek/deepseek-v4-flash-0731"
+        assert updated["provider_snapshot"] is None
+        assert updated["model_snapshot"] is None
+
 
 def _run_with_current_provider_and_model(job, current_provider, current_model, tmp_path):
     """Drive run_job with resolved provider pinned and config.yaml model.default

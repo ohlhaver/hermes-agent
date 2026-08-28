@@ -322,6 +322,64 @@ class TestGetJob:
 
 class TestUpdateJob:
     @pytest.mark.asyncio
+    async def test_update_job_forwards_route(self, adapter):
+        """PATCH /api/jobs/{id} forwards an optional provider/model route."""
+        app = _create_app(adapter)
+        updated_job = {
+            **SAMPLE_JOB,
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash-0731",
+        }
+        mock_update = MagicMock(return_value=updated_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={
+                        "provider": "openrouter",
+                        "model": "deepseek/deepseek-v4-flash-0731",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["job"] == updated_job
+                mock_update.assert_called_once_with(
+                    VALID_JOB_ID,
+                    {
+                        "provider": "openrouter",
+                        "model": "deepseek/deepseek-v4-flash-0731",
+                    },
+                )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (("provider", ""), ("model", 42)),
+    )
+    async def test_update_job_rejects_invalid_route(self, adapter, field, value):
+        """PATCH /api/jobs/{id} validates optional inference route fields."""
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={field: value},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "non-empty string" in data["error"]
+                mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_update_job(self, adapter):
         """PATCH /api/jobs/{id} updates with whitelisted fields."""
         app = _create_app(adapter)
