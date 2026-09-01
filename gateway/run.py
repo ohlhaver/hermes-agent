@@ -7857,7 +7857,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
-        self._update_runtime_status("running")
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -7955,6 +7954,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self._redeliver_pending_obligations()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        if await self._abort_startup_if_shutdown_requested():
+            return True
+        # Platform adapters connect before restart-interrupted sessions finish
+        # restoring.  Keep the public lifecycle state at ``starting`` until
+        # that restore gate has fully drained so external readiness probes do
+        # not dispatch a new turn that the gateway can only queue.
+        self._update_runtime_status("running")
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
