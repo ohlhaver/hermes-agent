@@ -1,5 +1,7 @@
-import pytest
+import asyncio
 from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
@@ -62,6 +64,78 @@ class _SuccessfulAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id):
         return {"id": chat_id}
+
+
+@pytest.mark.asyncio
+async def test_runner_stays_starting_until_startup_restore_finishes(
+    monkeypatch, tmp_path
+):
+    """Public readiness must stay closed while restart recovery is active."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=False, token="***")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    restore_entered = asyncio.Event()
+    release_restore = asyncio.Event()
+
+    async def finish_restore():
+        restore_entered.set()
+        await release_restore.wait()
+
+    monkeypatch.setattr(runner, "_finish_startup_restore", finish_restore)
+
+    start_task = asyncio.create_task(runner.start())
+    await restore_entered.wait()
+    assert read_runtime_status()["gateway_state"] == "starting"
+
+    release_restore.set()
+    assert await start_task is True
+    assert read_runtime_status()["gateway_state"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_runner_restore_failure_never_publishes_running(monkeypatch, tmp_path):
+    """A failed startup restore must leave public readiness closed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=False, token="***")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    async def fail_restore():
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(runner, "_finish_startup_restore", fail_restore)
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        await runner.start()
+    assert read_runtime_status()["gateway_state"] != "running"
+
+
+@pytest.mark.asyncio
+async def test_runner_shutdown_during_restore_never_reopens_readiness(
+    monkeypatch, tmp_path
+):
+    """A shutdown requested at the restore boundary must fail closed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=False, token="***")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    async def finish_restore_during_shutdown():
+        runner._shutdown_event.set()
+
+    monkeypatch.setattr(
+        runner, "_finish_startup_restore", finish_restore_during_shutdown
+    )
+
+    assert await runner.start() is True
+    assert read_runtime_status()["gateway_state"] != "running"
 
 
 @pytest.mark.asyncio
