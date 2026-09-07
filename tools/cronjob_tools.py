@@ -640,7 +640,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         # also clears the fire claim) and returns True iff it processed the job.
         from cron.executions import create_execution, get_execution
         execution = create_execution(job_id, source="direct")
-        processed = run_one_job({**job, "execution_id": execution["id"]})
+        run_one_job({**job, "execution_id": execution["id"]})
         recorded = get_execution(execution["id"]) or {}
         if recorded.get("status") in ("completed", "failed", "unknown"):
             outcome = recorded["status"]
@@ -648,14 +648,17 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 "claimed": True,
                 "success": None if outcome == "unknown" else outcome == "completed",
                 "outcome": outcome,
+                "execution_id": execution["id"],
                 "error": recorded.get("error"),
             }
-        refreshed = get_job(job_id) or {}
-        ok = refreshed.get("last_status") == "ok"
+        # A job's last_status may belong to an earlier attempt. Dispatch alone
+        # cannot promote this attempt to success, including after a lost receipt.
         return {
             "claimed": True,
-            "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
+            "success": None,
+            "outcome": recorded.get("status") if recorded.get("status") in {"claimed", "running"} else "unknown",
+            "execution_id": execution["id"],
+            "error": recorded.get("error") or "This execution has no confirmed terminal outcome.",
         }
 
     except Exception as e:
@@ -859,6 +862,8 @@ def cronjob(
             result["execution_success"] = exec_result.get("success", False)
             if "outcome" in exec_result:
                 result["execution_outcome"] = exec_result["outcome"]
+            if "execution_id" in exec_result:
+                result["execution_id"] = exec_result["execution_id"]
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."

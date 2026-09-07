@@ -257,3 +257,101 @@ def test_output_save_failure_does_not_relabel_unknown_as_execution_failure(ledge
     assert scheduler.run_one_job(job) is False  # processing failed, execution unconfirmed
     assert ledger.latest_execution(job["id"])["status"] == "unknown"
     assert jobs.get_job(job["id"])["last_status"] == "unknown"
+
+
+@pytest.mark.parametrize("recorded_state", ["claimed", "running", None])
+def test_manual_attempt_never_inherits_previous_job_success(ledger, monkeypatch, recorded_state):
+    from tools.cronjob_tools import _execute_job_now
+    job = jobs.create_job("offline", "every 1h")
+    jobs.mark_job_run(job["id"], True)
+    def unfinished(attempt, **kwargs):
+        if recorded_state == "running":
+            ledger.mark_execution_running(attempt["execution_id"])
+        return True  # dispatch acknowledgement is not an execution result
+    monkeypatch.setattr(scheduler, "run_one_job", unfinished)
+    if recorded_state is None:
+        monkeypatch.setattr(ledger, "get_execution", lambda _: None)
+    result = _execute_job_now(job)
+    assert result["claimed"] is True
+    assert result["success"] is None
+    assert result["outcome"] == (recorded_state or "unknown")
+    assert result["execution_id"]
+    assert jobs.get_job(job["id"])["last_status"] == "ok"
+
+
+def test_same_second_runs_use_their_ledger_identity(native, ledger, monkeypatch):
+    _, manager, dispatch = native
+    calls = _install(manager, "completed")
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+        "provider": "openrouter", "api_mode": "chat_completions",
+        "api_key": "offline-test-key", "base_url": "http://127.0.0.1:1/v1",
+    })
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: datetime(2026, 9, 7, 12, tzinfo=timezone.utc))
+    deliveries = []
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda job, content, **kw: deliveries.append(dict(job)))
+    job = jobs.create_job("offline", "every 1h", model="test-model")
+    assert scheduler.run_one_job(job)
+    assert scheduler.run_one_job(job)
+    assert "execution_id" not in job  # no attempt state in reusable job input
+    assert len(set(calls)) == 2
+    for call, delivered in zip(calls, deliveries):
+        attempt = ledger.get_execution(delivered["execution_id"])
+        assert attempt["job_id"] == job["id"]
+        assert attempt["status"] == delivered["execution_outcome"] == "completed"
+        assert call == ledger.execution_session_id(job["id"], attempt["id"])
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize("live_success", [True, False, None])
+def test_real_delivery_paths_keep_exact_attempt_metadata(ledger, monkeypatch, live_success):
+    import asyncio
+    import threading
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+    import gateway.run
+
+    captured = []
+    async def standalone(config, chat_id, message, *, metadata=None, **kwargs):
+        captured.append(("standalone", dict(metadata or {})))
+        return {"success": True, "message_id": "standalone-receipt"}
+    platform_registry.register(PlatformEntry(name="cron_identity_test", label="Synthetic", adapter_factory=lambda cfg: adapter, check_fn=lambda: True, standalone_sender_fn=standalone))
+    platform = Platform("cron_identity_test")
+    config = PlatformConfig(enabled=True)
+    class Adapter(BasePlatformAdapter):
+        async def connect(self):
+            return True
+        async def disconnect(self):
+            pass
+        async def get_chat_info(self, chat_id):
+            return {"type": "dm", "name": "Synthetic"}
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            captured.append(("live", dict(metadata or {})))
+            return SendResult(success=bool(live_success), message_id="live-receipt", error=None if live_success else "synthetic refusal")
+    adapter = Adapter(config, platform)
+    monkeypatch.setattr(gateway.run, "_gateway_runner_ref", lambda: None)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: SimpleNamespace(platforms={platform: config}))
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(started.set)
+        loop.run_forever()
+    worker = threading.Thread(target=run_loop)
+    worker.start()
+    assert started.wait(5)
+    try:
+        job = jobs.create_job("offline", "every 1h")
+        first = ledger.create_execution(job["id"], source="direct")
+        ledger.create_execution(job["id"], source="direct")  # newer is unrelated
+        delivering = {**job, "execution_id": first["id"], "execution_outcome": "unknown", "deliver": "origin", "origin": {"platform": platform.value, "chat_id": "home"}}
+        assert scheduler._deliver_result(delivering, "Unconfirmed result", adapters={platform: adapter} if live_success is not None else None, loop=loop) is None
+        expected = {"job_id": job["id"], "execution_id": first["id"], "session_id": ledger.execution_session_id(job["id"], first["id"]), "execution_outcome": "unknown"}
+        assert [path for path, _ in captured] == (["standalone"] if live_success is None else ["live"] if live_success else ["live", "standalone"])
+        assert all(metadata == expected for _, metadata in captured)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        worker.join(5)
+        loop.close()
+        platform_registry.unregister(platform.value)

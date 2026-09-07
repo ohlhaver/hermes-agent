@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 import threading
 import time
 
@@ -278,7 +279,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import create_execution, execution_session_id, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1453,6 +1454,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    execution_metadata = {"job_id": job["id"]}
+    if job.get("execution_id"):
+        execution_metadata.update({
+            "execution_id": job["execution_id"],
+            "session_id": execution_session_id(job["id"], job["execution_id"]),
+        })
+        if job.get("execution_outcome") in {"completed", "failed", "unknown"}:
+            execution_metadata["execution_outcome"] = job["execution_outcome"]
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -1697,7 +1706,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_thread_id = None
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
-                    "job_id": job["id"],
+                    **execution_metadata,
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -1712,7 +1721,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = dict(execution_metadata)
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
@@ -1940,7 +1949,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=execution_metadata)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -1969,7 +1978,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=execution_metadata))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2908,7 +2917,9 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # run_one_job supplies the ledger UUID. Direct run_job callers still get a
+    # unique session, but do not invent a persisted execution receipt.
+    _cron_session_id = execution_session_id(job_id, job.get("execution_id") or uuid.uuid4().hex)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3733,6 +3744,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    # Keep attempt fields local: parallel firings may share the same job value.
+    job = {**job, "execution_id": execution_id}
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3848,7 +3861,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_job = {**job, "execution_outcome": (
+                        "unknown" if success is None else "completed" if success else "failed"
+                    )}
+                    delivery_error = _deliver_result(delivery_job, deliver_content, adapters=adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
