@@ -16,13 +16,21 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
 
 
+def _finish_attempt(success, error=None):
+    def run(job, **kwargs):
+        from cron.executions import finish_execution
+        finish_execution(job["execution_id"], success=success, error=error)
+        return True
+    return run
+
+
 class TestCronjobRunExecutesImmediately:
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
-             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("cron.scheduler.run_one_job", side_effect=_finish_attempt(True)) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
             out = json.loads(cronjob(action="run", job_id="job-run-1"))
 
@@ -46,12 +54,12 @@ class TestCronjobRunExecutesImmediately:
         assert "execution_skipped" in out["job"]
         m_run.assert_not_called()  # claim lost -> never fired
 
-    def test_run_reports_failure_from_last_status(self):
-        """A failed run is reported via the re-read job's last_status/last_error."""
+    def test_run_reports_failure_from_exact_execution(self):
+        """The failure belongs to this attempt's ledger, not job history."""
         failed = {"id": "job-run-1", "last_status": "error", "last_error": "provider 500"}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
-             patch("cron.scheduler.run_one_job", return_value=True), \
+             patch("cron.scheduler.run_one_job", side_effect=_finish_attempt(False, "provider 500")), \
              patch("tools.cronjob_tools.get_job", return_value=failed):
             out = json.loads(cronjob(action="run", job_id="job-run-1"))
 

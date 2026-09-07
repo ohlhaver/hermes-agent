@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -691,6 +692,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    metadata=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -718,7 +720,7 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = {}
+                metadata = dict(metadata or {})
                 if thread_id:
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
@@ -743,6 +745,16 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            # Existing senders keep their old signature. A sender that consumes
+            # execution identity explicitly opts in with metadata (or **kwargs).
+            extra = {}
+            if metadata:
+                try:
+                    parameters = inspect.signature(entry.standalone_sender_fn).parameters
+                except (TypeError, ValueError):
+                    parameters = {}
+                if "metadata" in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+                    extra["metadata"] = dict(metadata)
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
@@ -750,6 +762,7 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                **extra,
             )
         except asyncio.CancelledError:
             raise
@@ -777,7 +790,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, *, metadata=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1092,6 +1105,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                metadata=metadata,
             )
 
         if isinstance(result, dict) and result.get("error"):

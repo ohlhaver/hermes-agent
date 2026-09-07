@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -23,6 +24,20 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+
+
+def execution_session_id(job_id: str, execution_id: str) -> str:
+    """Bind a cron conversation to its durable attempt, without wall-clock guesses.
+
+    A job can run twice in the same second. The ledger already gives those
+    attempts distinct UUIDs; runtime middleware and both delivery paths must
+    receive that identity instead of independently reconstructing a timestamp.
+    """
+    if (not isinstance(job_id, str) or not job_id
+            or not isinstance(execution_id, str)
+            or not re.fullmatch(r"[a-f0-9]{32}", execution_id)):
+        raise ValueError("Invalid cron execution identity")
+    return f"cron_{job_id}_{execution_id}"
 
 
 def _connect() -> sqlite3.Connection:
