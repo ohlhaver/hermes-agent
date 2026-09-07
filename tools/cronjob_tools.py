@@ -615,7 +615,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     failure delivery, ``[SILENT]`` handling, and live-adapter delivery stay
     identical across paths and can't drift.
 
-    Returns {"claimed": bool, "success": bool, "error": str|None}.
+    Returns claimed, success (None for unknown), error, and recorded outcome.
     """
     job_id = job["id"]
     try:
@@ -638,7 +638,18 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        from cron.executions import create_execution, get_execution
+        execution = create_execution(job_id, source="direct")
+        processed = run_one_job({**job, "execution_id": execution["id"]})
+        recorded = get_execution(execution["id"]) or {}
+        if recorded.get("status") in ("completed", "failed", "unknown"):
+            outcome = recorded["status"]
+            return {
+                "claimed": True,
+                "success": None if outcome == "unknown" else outcome == "completed",
+                "outcome": outcome,
+                "error": recorded.get("error"),
+            }
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -846,6 +857,8 @@ def cronjob(
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
+            if "outcome" in exec_result:
+                result["execution_outcome"] = exec_result["outcome"]
             if not exec_result.get("claimed", False):
                 result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
