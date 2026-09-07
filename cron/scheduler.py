@@ -2658,7 +2658,7 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
-) -> tuple[bool, str, str, Optional[str]]:
+) -> tuple[Optional[bool], str, str, Optional[str]]:
     """
     Execute a single cron job.
 
@@ -2673,7 +2673,8 @@ def run_job(
     every existing caller is unchanged.
 
     Returns:
-        Tuple of (success, full_output_doc, final_response, error_message)
+        Tuple of (success, full_output_doc, final_response, error_message).
+        success is None only for an explicit unconfirmed execution outcome.
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
@@ -3516,6 +3517,11 @@ def run_job(
         # would otherwise be delivered as if it were the agent's reply and the
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
+        if result.get("execution_outcome") == "unknown":
+            explanation = result.get("final_response") or "Execution outcome could not be confirmed."
+            output = f"# Cron Job: {job_name} (UNKNOWN)\n\n{explanation}\n"
+            return None, output, explanation, explanation
+
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
         max_iteration_summary = (
@@ -3723,6 +3729,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    unconfirmed_outcome = False
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -3778,6 +3785,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents
             )
+            unconfirmed_outcome = success is None
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -3819,7 +3827,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            deliver_content = (
+                (final_response or "Execution outcome could not be confirmed.")
+                if success is None else
+                final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -3854,16 +3866,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        outcome_kwargs = {"outcome": "unknown"} if success is None else {}
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
+            mark_job_run(job["id"], success, error, delivery_error=delivery_error, **outcome_kwargs)
+        finish_execution(execution_id, success=success, error=error, **outcome_kwargs)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
-        finish_execution(execution_id, success=False, error=str(e))
+            mark_job_run(
+                job["id"], None if unconfirmed_outcome else False, str(e),
+                **({"outcome": "unknown"} if unconfirmed_outcome else {}),
+            )
+        finish_execution(
+            execution_id, success=None if unconfirmed_outcome else False, error=str(e),
+            **({"outcome": "unknown"} if unconfirmed_outcome else {}),
+        )
         return False
 
 

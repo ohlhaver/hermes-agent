@@ -679,6 +679,7 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    execution_outcome = None
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -1452,7 +1453,7 @@ def run_conversation(
                         )
                     return agent._interruptible_api_call(next_api_kwargs)
 
-                from hermes_cli.middleware import run_llm_execution_middleware
+                from hermes_cli.middleware import LLMExecutionOutcome, run_llm_execution_middleware
 
                 response = run_llm_execution_middleware(
                     api_kwargs,
@@ -1489,6 +1490,13 @@ def run_conversation(
                     resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                     logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
                 
+                if isinstance(response, LLMExecutionOutcome):
+                    execution_outcome = response.for_session(agent.session_id or "")
+                    final_response = execution_outcome.content
+                    failed = execution_outcome.status == "failed"
+                    _turn_exit_reason = "middleware_outcome:" + execution_outcome.status
+                    break  # Exit provider retries; the outer loop finalizes below.
+
                 # Validate response shape before proceeding
                 response_invalid = False
                 error_details = []
@@ -4379,6 +4387,9 @@ def run_conversation(
                             f"{int(sleep_end - time.time())}s remaining"
                         )
         
+        if execution_outcome is not None:
+            break  # No response normalization, retry, or additional execution.
+
         # If the API call was interrupted, skip response processing
         if interrupted:
             _turn_exit_reason = "interrupted_during_api_call"
@@ -5795,6 +5806,7 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        execution_outcome=execution_outcome,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )

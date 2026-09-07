@@ -132,13 +132,27 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone())
 
 
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Read the exact attempt, including after its one-shot job was removed."""
+    with _lock, _connect() as conn:
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+
+
 def finish_execution(
-    execution_id: str, *, success: bool, error: Optional[str] = None,
+    execution_id: str, *, success: Optional[bool] = None, error: Optional[str] = None,
+    outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
-    status = "completed" if success else "failed"
-    detail = None if success else (str(error) if error else "unknown failure")
+    from cron.outcomes import resolve_outcome
+    status = resolve_outcome(success, outcome)
+    detail = None if status == "completed" else (
+        str(error) if error else (
+            "execution outcome unconfirmed" if status == "unknown" else "unknown failure"
+        )
+    )
     with _lock, _connect() as conn:
         cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?

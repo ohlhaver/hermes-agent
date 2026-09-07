@@ -81,6 +81,7 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    execution_outcome=None,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -200,6 +201,10 @@ def finalize_turn(
             or normal_text_response
         )
     )
+
+    if execution_outcome is not None:
+        completed = execution_outcome.status == "completed"
+        failed = execution_outcome.status == "failed"
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -547,6 +552,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if execution_outcome is not None:
+        result["execution_outcome"] = execution_outcome.status
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

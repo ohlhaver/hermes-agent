@@ -34,6 +34,39 @@ VALID_MIDDLEWARE: set[str] = {
 }
 
 
+LLM_EXECUTION_OUTCOME_VERSION = "hermes.llm_execution_outcome.v1"
+
+
+@dataclass(frozen=True)
+class LLMExecutionOutcome:
+    """End this conversation without interpreting a provider-shaped response.
+
+    The concrete consumer is a middleware that hands execution to another
+    executor. Unknown ends only the local handoff; it does not claim the
+    remote workload failed or stopped. Bind to the exact session supplied to
+    the middleware, never to a process-global or a reusable job identity.
+    """
+
+    status: str
+    content: str
+    session_id: str
+
+    def for_session(self, session_id: str) -> "LLMExecutionOutcome":
+        # Validate here, outside the exception-isolating middleware chain.
+        # A malformed/misbound return must never trigger another provider call
+        # or leak the other session's content.
+        if (self.status not in ("completed", "failed", "unknown")
+                or not isinstance(self.content, str)
+                or not self.content.strip()
+                or not isinstance(self.session_id, str)
+                or not self.session_id
+                or self.session_id != session_id):
+            return LLMExecutionOutcome(
+                "unknown", "Execution outcome could not be confirmed.", session_id,
+            )
+        return self
+
+
 @dataclass
 class RequestMiddlewareResult:
     """Result of applying request middleware to a mutable payload."""

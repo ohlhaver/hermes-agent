@@ -1512,8 +1512,8 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(job_id: str, success: Optional[bool] = None, error: Optional[str] = None,
+                 delivery_error: Optional[str] = None, *, outcome: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1523,14 +1523,18 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
+    from cron.outcomes import resolve_outcome
+    terminal_outcome = resolve_outcome(success, outcome)
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
+                job["last_status"] = {
+                    "completed": "ok", "failed": "error", "unknown": "unknown",
+                }[terminal_outcome]
+                job["last_error"] = error if terminal_outcome != "completed" else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
