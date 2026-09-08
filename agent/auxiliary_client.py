@@ -5629,14 +5629,21 @@ def resolve_vision_provider_client(
         main_provider = str(runtime.get("provider") or _read_main_provider())
         main_model = str(runtime.get("model") or _read_main_model())
         if main_provider and main_provider not in {"auto", ""}:
+            configured_vision_model = resolved_model
             # A provider-specific vision default wins over the user's chat model:
             # static overrides (xiaomi/zai) and catalog-backed discovery (the
             # DeepInfra profile hook) both yield a *known* vision-capable model,
             # whereas the pinned chat model is usually NOT multimodal (e.g. the
             # DeepSeek-V4-Flash default) and _main_model_supports_vision can't be
-            # trusted to catch that. Only fall back to the chat model when no
-            # provider default is available (catalog unreachable).
-            vision_model = _resolve_provider_vision_default(main_provider) or main_model
+            # trusted to catch that. An explicit auxiliary.vision.model wins
+            # first: it is the user's selected vision backend on the same
+            # request-scoped provider, even when the main chat model is text-only.
+            # Only fall back to the chat model when neither override exists.
+            vision_model = (
+                configured_vision_model
+                or _resolve_provider_vision_default(main_provider)
+                or main_model
+            )
             if main_provider == "nous":
                 sync_client, default_model = _resolve_strict_vision_backend(
                     main_provider, vision_model
@@ -5660,7 +5667,10 @@ def resolve_vision_provider_client(
                     "vision support) — falling through to aggregator chain",
                     main_provider,
                 )
-            elif not _main_model_supports_vision(main_provider, vision_model):
+            elif (
+                not configured_vision_model
+                and not _main_model_supports_vision(main_provider, vision_model)
+            ):
                 # The main model is known to be text-only (e.g. DeepSeek V4,
                 # gpt-oss-120b without vision). Building a client and sending
                 # an image would produce a cryptic provider-side error like
@@ -5687,8 +5697,11 @@ def resolve_vision_provider_client(
                 # endpoint that ``set_runtime_main()`` recorded for this turn so
                 # Step 1 can build a working client.
                 rpc_base_url = None
-                rpc_api_key = None
-                rpc_api_mode = resolved_api_mode
+                # Named providers normally resolve process-wide credentials.
+                # A gateway turn may instead carry the only usable credential
+                # in its immutable runtime binding, so forward that key too.
+                rpc_api_key = runtime.get("api_key") or None
+                rpc_api_mode = resolved_api_mode or runtime.get("api_mode") or None
                 if main_provider == "custom" or main_provider.startswith("custom:"):
                     runtime_base_url = runtime.get("base_url")
                     if runtime_base_url:
