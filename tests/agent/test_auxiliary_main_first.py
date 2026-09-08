@@ -13,7 +13,9 @@ runs when the main provider has no working client.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import asyncio
+
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 
@@ -374,6 +376,84 @@ class TestResolveVisionMainFirst:
         assert mock_resolve.call_args.args[0] == "openrouter"
         assert mock_resolve.call_args.args[1] == "anthropic/claude-sonnet-4.6"
         assert mock_resolve.call_args.kwargs.get("is_vision") is True
+
+    def test_configured_auto_vision_model_uses_request_scoped_openrouter_key(
+        self, monkeypatch, tmp_path
+    ):
+        """A text-only OpenRouter main may use a separate scoped vision model.
+
+        This exercises the final async auxiliary invocation with a real config
+        load and an offline transport.  The process-wide OpenRouter key stays
+        absent: the client must be built from the turn's ``main_runtime`` key.
+        """
+        import yaml
+
+        import agent.auxiliary_client as aux
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "auxiliary": {
+                        "vision": {
+                            "provider": "auto",
+                            "model": "openai/gpt-5.6-luna",
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        sync_client = MagicMock()
+        async_client = MagicMock()
+        async_client.chat.completions.create = AsyncMock(
+            return_value=MagicMock(
+                choices=[MagicMock(message=MagicMock(content="offline vision result"))],
+                usage=MagicMock(prompt_tokens=10, completion_tokens=5),
+            )
+        )
+        captured = {}
+
+        def fake_create_openai_client(*, api_key, base_url, **_kwargs):
+            captured.update(api_key=api_key, base_url=base_url)
+            return sync_client
+
+        with patch.object(
+            aux, "_create_openai_client", side_effect=fake_create_openai_client
+        ), patch.object(
+            aux, "_to_async_client",
+            return_value=(async_client, "openai/gpt-5.6-luna"),
+        ), patch.object(
+            aux, "_main_model_supports_vision", return_value=False
+        ), patch.object(
+            aux, "_resolve_strict_vision_backend", return_value=(None, None)
+        ):
+            response = asyncio.run(
+                aux.async_call_llm(
+                    task="vision",
+                    main_runtime={
+                        "provider": "openrouter",
+                        "model": "deepseek/deepseek-v4-flash-0731",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "api_key": "request-scoped-test-key",
+                        "api_mode": "chat_completions",
+                        "auth_mode": "api_key",
+                    },
+                    messages=[{"role": "user", "content": "describe image"}],
+                )
+            )
+
+        assert response.choices[0].message.content == "offline vision result"
+        assert captured == {
+            "api_key": "request-scoped-test-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        assert async_client.chat.completions.create.await_args.kwargs["model"] == (
+            "openai/gpt-5.6-luna"
+        )
 
     def test_nous_main_vision_uses_paid_nous_vision_backend(self):
         """Paid Nous main → aux vision uses the dedicated Nous vision backend."""
