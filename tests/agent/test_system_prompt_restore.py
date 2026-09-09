@@ -16,14 +16,24 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.system_prompt import stamp_system_prompt_contract
 
 
-def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
+_CONTRACT_A = "a" * 64
+_CONTRACT_B = "b" * 64
+
+
+def _make_agent(
+    session_db=None,
+    prebuilt_prompt: str = "BUILT_PROMPT",
+    contract_fingerprint: str = _CONTRACT_A,
+):
     """Construct the minimal agent fake the helper needs."""
     agent = MagicMock()
     agent._cached_system_prompt = None
@@ -32,8 +42,26 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.provider = "openrouter"
     agent.platform = "cli"
     agent._session_db = session_db
-    agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
+    agent._build_system_prompt = MagicMock(
+        return_value=stamp_system_prompt_contract(
+            prebuilt_prompt, contract_fingerprint
+        )
+    )
+    agent._prompt_contract_fingerprint = contract_fingerprint
     return agent
+
+
+@pytest.fixture(autouse=True)
+def _stub_prompt_contract_fingerprint(monkeypatch):
+    """Keep restore tests focused on persistence decisions, not prompt assembly."""
+
+    def build_fingerprint(agent, _system_message):
+        return agent._prompt_contract_fingerprint, []
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.build_system_prompt_contract_fingerprint",
+        build_fingerprint,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +72,9 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 class TestStoredPromptReuse:
     def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
-        stored = "Stored prompt from turn 1 — byte-identical reuse"
+        stored = stamp_system_prompt_contract(
+            "Stored prompt from turn 1 — byte-identical reuse", _CONTRACT_A
+        )
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
@@ -60,7 +90,9 @@ class TestStoredPromptReuse:
 
     def test_present_row_with_unicode_preserved(self):
         """Non-ASCII bytes in the stored prompt are not mangled."""
-        stored = "Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊"
+        stored = stamp_system_prompt_contract(
+            "Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊", _CONTRACT_A
+        )
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
@@ -100,14 +132,91 @@ class TestStoredPromptReuse:
         with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
             _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
 
-        assert agent._cached_system_prompt.endswith(
-            "Model: openai/gpt-5.5\nProvider: openrouter"
+        assert "Model: openai/gpt-5.5\nProvider: openrouter" in (
+            agent._cached_system_prompt
         )
         agent._build_system_prompt.assert_called_once_with(None)
         db.update_system_prompt.assert_called_once_with(
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_changed_platform_contract_rebuilds_with_same_model_and_provider(self):
+        """A platform instruction change invalidates an otherwise matching row."""
+        stored = stamp_system_prompt_contract(
+            "Old platform prompt\nModel: test-model\nProvider: openrouter",
+            _CONTRACT_A,
+        )
+        rebuilt = (
+            "New platform prompt\nModel: test-model\nProvider: openrouter"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(
+            session_db=db,
+            prebuilt_prompt=rebuilt,
+            contract_fingerprint=_CONTRACT_B,
+        )
+
+        history = [
+            {"role": "user", "content": "Keep this question"},
+            {"role": "assistant", "content": "Keep this answer"},
+        ]
+        before = deepcopy(history)
+        _restore_or_build_system_prompt(agent, None, history)
+
+        assert agent._cached_system_prompt == stamp_system_prompt_contract(
+            rebuilt, _CONTRACT_B
+        )
+        assert history == before
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, agent._cached_system_prompt
+        )
+
+    def test_changed_soul_or_context_input_rebuilds_without_rewriting_history(self):
+        """SOUL/context changes replace only the prompt snapshot, never messages."""
+        stored = stamp_system_prompt_contract(
+            "Old SOUL and context\nModel: test-model\nProvider: openrouter",
+            _CONTRACT_A,
+        )
+        rebuilt = "New SOUL and context\nModel: test-model\nProvider: openrouter"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(
+            session_db=db,
+            prebuilt_prompt=rebuilt,
+            contract_fingerprint=_CONTRACT_B,
+        )
+        history = [
+            {"role": "user", "content": "Keep this question"},
+            {"role": "assistant", "content": "Keep this answer"},
+        ]
+        before = deepcopy(history)
+
+        _restore_or_build_system_prompt(agent, "new system input", history)
+
+        assert history == before
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, agent._cached_system_prompt
+        )
+        assert "New SOUL and context" in agent._cached_system_prompt
+
+    def test_legacy_prompt_without_contract_fingerprint_rebuilds_once(self):
+        """Rows created before contract fingerprints cannot be trusted as current."""
+        db = MagicMock()
+        db.get_session.return_value = {
+            "system_prompt": "Legacy prompt\nModel: test-model\nProvider: openrouter"
+        }
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "history"}]
+        )
+
+        assert agent._cached_system_prompt == agent._build_system_prompt.return_value
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, agent._cached_system_prompt
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +236,14 @@ class TestLegitimateFreshBuild:
         # No history → DB read skipped entirely
         db.get_session.assert_not_called()
         agent._build_system_prompt.assert_called_once_with(None)
-        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        assert agent._cached_system_prompt == stamp_system_prompt_contract(
+            "BUILT_PROMPT", _CONTRACT_A
+        )
         # Persisted to DB
-        db.update_system_prompt.assert_called_once_with(agent.session_id, "BUILT_PROMPT")
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id,
+            stamp_system_prompt_contract("BUILT_PROMPT", _CONTRACT_A),
+        )
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_no_db_skips_persistence(self):
@@ -137,7 +251,9 @@ class TestLegitimateFreshBuild:
         agent = _make_agent(session_db=None)
         _restore_or_build_system_prompt(agent, None, [])
         agent._build_system_prompt.assert_called_once()
-        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        assert agent._cached_system_prompt == stamp_system_prompt_contract(
+            "BUILT_PROMPT", _CONTRACT_A
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +273,9 @@ class TestSilentFailureWarnings:
 
         # Built fresh
         agent._build_system_prompt.assert_called_once()
-        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        assert agent._cached_system_prompt == stamp_system_prompt_contract(
+            "BUILT_PROMPT", _CONTRACT_A
+        )
         # Loud warning about the read failure
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("get_session failed" in r.getMessage() for r in warnings), \
@@ -205,7 +323,9 @@ class TestSilentFailureWarnings:
 
         # Built and assigned the cache anyway
         agent._build_system_prompt.assert_called_once()
-        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        assert agent._cached_system_prompt == stamp_system_prompt_contract(
+            "BUILT_PROMPT", _CONTRACT_A
+        )
         # Warning surfaced
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any(
@@ -248,6 +368,7 @@ class TestPromptStabilityInvariant:
             "Conversation started: Sunday, May 17, 2026\n"
             "Session ID: 20260517_153500_abc123\n"
         )
+        stored = stamp_system_prompt_contract(stored, _CONTRACT_A)
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
