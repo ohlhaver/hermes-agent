@@ -40,6 +40,48 @@ class TestCronjobRunExecutesImmediately:
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
         m_run.assert_called_once()                       # fired via the shared body
 
+    def test_run_carries_output_instructions_only_for_that_execution(self):
+        from cron.scheduler import _build_job_prompt
+        saved_job = dict(_JOB)
+        constraint = "Return technical status only. Do not include mail contents or summaries."
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=saved_job), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", side_effect=_finish_attempt(True)) as run, \
+             patch("tools.cronjob_tools.get_job", return_value=saved_job), \
+             patch("tools.cronjob_tools.update_job") as update:
+            first = json.loads(cronjob(action="run", job_id=saved_job["id"], prompt=constraint))
+            second = json.loads(cronjob(action="run", job_id=saved_job["id"]))
+        first_job, second_job = [call.args[0] for call in run.call_args_list]
+        assert first_job["prompt"].startswith(_JOB["prompt"] + "\n\n")
+        assert "take precedence over conflicting saved output instructions" in first_job["prompt"]
+        assert constraint in _build_job_prompt(first_job)
+        assert second_job["prompt"] == _JOB["prompt"]
+        assert saved_job == _JOB
+        assert constraint not in _build_job_prompt(saved_job)
+        update.assert_not_called()
+        assert first["job"]["execution_id"] != second["job"]["execution_id"]
+        assert first["job"]["execution_success"] is True
+        assert second["job"]["execution_success"] is True
+
+    def test_run_rejects_blocked_output_instructions_before_claim(self):
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("tools.cronjob_tools._scan_cron_prompt", return_value="blocked test instruction"), \
+             patch("tools.cronjob_tools.claim_job_for_fire") as claim, \
+             patch("cron.scheduler.run_one_job") as run:
+            result = json.loads(cronjob(action="run", job_id=_JOB["id"], prompt="test instruction"))
+        assert result.get("success") is False
+        claim.assert_not_called()
+        run.assert_not_called()
+
+    def test_run_rejects_output_instructions_for_script_only_job_before_claim(self):
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value={**_JOB, "no_agent": True}), \
+             patch("tools.cronjob_tools.claim_job_for_fire") as claim, \
+             patch("cron.scheduler.run_one_job") as run:
+            result = json.loads(cronjob(action="run", job_id=_JOB["id"], prompt="Return technical status only."))
+        assert result.get("success") is False
+        claim.assert_not_called()
+        run.assert_not_called()
+
     def test_run_skips_when_claim_lost(self):
         """If the scheduler already holds the fire claim, do NOT double-run."""
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
