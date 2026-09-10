@@ -4368,6 +4368,35 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
+    def test_tool_exposure_hook_uses_post_middleware_request_despite_payload_truncation(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(content="Done", finish_reason="stop")
+        calls = []
+        final_tools = [{"type": "function", "function": {
+            "name": "skill_view", "description": "PRIVATE_SCHEMA", "parameters": {"type": "object"},
+        }}]
+
+        def middleware(payload, **_kwargs):
+            return SimpleNamespace(payload={**payload, "tools": final_tools}, original_payload=payload, trace=[])
+
+        with (
+            patch("hermes_cli.middleware.apply_llm_request_middleware", side_effect=middleware),
+            patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_api_request"),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=lambda name, **kw: calls.append((name, kw))),
+            patch.object(agent, "_api_request_payload_for_hook", return_value={"truncated": True}),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("PRIVATE_MESSAGE")
+        assert result["final_response"] == "Done"
+        prepared = [kw for name, kw in calls if name == "pre_api_request"]
+        assert len(prepared) == 1
+        assert prepared[0]["request"] == {"truncated": True}
+        assert prepared[0]["request_tool_exposure"] == {"names": ["skill_view"], "count": 1, "complete": True}
+        assert agent.client.chat.completions.create.call_args.kwargs["tools"] == final_tools
+        assert agent.tools != final_tools
+
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
         hook_called = False

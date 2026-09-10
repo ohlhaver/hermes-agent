@@ -1356,6 +1356,7 @@ def run_conversation(
                         invoke_hook as _invoke_hook,
                     )
                     if has_hook("pre_api_request"):
+                        from tools.schema_sanitizer import summarize_request_tools
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -1397,6 +1398,7 @@ def run_conversation(
                             else [],
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
+                            request_tool_exposure=summarize_request_tools(api_kwargs, agent.api_mode),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
