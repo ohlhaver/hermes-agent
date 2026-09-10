@@ -368,6 +368,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
 
         if malformed_args_result is not None:
+            malformed_args_result = agent._guardrail_invalid_tool_arguments(
+                function_name, tool_call.function.arguments, malformed_args_result,
+            )
             parsed_calls.append(
                 (
                     tool_call,
@@ -1063,6 +1066,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
+            malformed_args_result = agent._guardrail_invalid_tool_arguments(
+                function_name, tool_call.function.arguments, malformed_args_result,
+            )
             messages.append(
                 make_tool_result_message(
                     function_name,

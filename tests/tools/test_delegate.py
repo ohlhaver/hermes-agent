@@ -600,8 +600,9 @@ class TestToolNamePreservation(unittest.TestCase):
         standalone (without _run_single_child's scope) must never raise NameError.
         """
         parent = _make_mock_parent(depth=0)
+        parent._tool_failure_fallback = "Ich konnte diesen Schritt nicht abschließen."
 
-        with patch("run_agent.AIAgent"):
+        with patch("run_agent.AIAgent") as constructor:
             try:
                 _build_child_agent(
                     task_index=0,
@@ -613,6 +614,7 @@ class TestToolNamePreservation(unittest.TestCase):
                     parent_agent=parent,
                     task_count=1,
                 )
+                self.assertEqual(constructor.return_value._tool_failure_fallback, parent._tool_failure_fallback)
             except NameError as exc:
                 self.fail(
                     f"_build_child_agent raised NameError — "

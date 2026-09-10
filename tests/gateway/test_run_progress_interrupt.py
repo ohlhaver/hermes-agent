@@ -153,7 +153,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
+async def _run_once(monkeypatch, tmp_path, agent_cls, session_id, tool_failure_fallback=None):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -185,6 +185,7 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
         history=[],
         source=source,
         session_id=session_id,
+        tool_failure_fallback=tool_failure_fallback,
         session_key="agent:main:telegram:group:-1001:17585",
     )
     return adapter, result
@@ -249,3 +250,15 @@ async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_pa
             f"event '{leaked_query}' leaked into the UI after interrupt — "
             f"progress_callback / drain loop is not checking is_interrupted"
         )
+
+
+@pytest.mark.asyncio
+async def test_gateway_forwards_explicit_fallback_into_agent_turn(monkeypatch, tmp_path):
+    class CaptureFallbackAgent(PreInterruptAgent):
+        def run_conversation(self, message, **kwargs):
+            return {"final_response": self._tool_failure_fallback or "no locale copy", "messages": [], "api_calls": 1}
+    fallback = "Ich konnte diesen Schritt nicht abschließen."
+    _, result = await _run_once(monkeypatch, tmp_path, CaptureFallbackAgent, "localized", fallback)
+    assert result["final_response"] == fallback
+    _, no_metadata = await _run_once(monkeypatch, tmp_path, CaptureFallbackAgent, "no-localized")
+    assert no_metadata["final_response"] == "no locale copy"

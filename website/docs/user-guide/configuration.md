@@ -1412,6 +1412,7 @@ For unattended gateway / server deployments, enable hard stops so a stuck agent 
 tool_loop_guardrails:
   warnings_enabled: true       # inject warnings into tool results (default: true)
   hard_stop_enabled: false     # also BLOCK the call past the hard-stop threshold (default: false)
+  failure_hard_stop_enabled: false # stop failures only; successful repeated reads remain allowed
   warn_after:
     exact_failure: 2           # identical failing call repeated N times
     same_tool_failure: 3       # same tool failing N times (different args)
@@ -1423,6 +1424,17 @@ tool_loop_guardrails:
 ```
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
+
+For failure-only stopping, set `failure_hard_stop_enabled: true` while leaving
+`hard_stop_enabled: false`. This uses the same exact-failure and same-tool-failure
+thresholds, including argument failures rejected before dispatch. It does not
+block successful repeated reads or change the overall iteration budget. Counts
+reset for the next request. A stopped request gets one tool-free completion in
+the conversation's language; if that completion fails or is empty, Hermes returns
+the platform-provided localized fallback from `MessageEvent.metadata["tool_failure_fallback"]`,
+or short English copy when no platform fallback was provided, without internal error details.
+This per-request copy is also inherited by delegated agents. The completion instruction
+is not persisted as a user message. Both stopping options default to `false`.
 
 ## TTS Configuration
 

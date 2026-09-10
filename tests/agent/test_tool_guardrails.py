@@ -167,6 +167,37 @@ def test_same_tool_varying_args_warns_by_default_without_halting():
     assert controller.halt_decision is None
 
 
+def test_failure_only_config_stops_errors_but_allows_successful_repeated_reads():
+    config = ToolCallGuardrailConfig.from_mapping({"failure_hard_stop_enabled": True})
+    controller = ToolCallGuardrailController(config)
+    assert config.hard_stop_enabled is False
+    args = {"query": "same"}
+    for _ in range(config.exact_failure_block_after):
+        assert controller.before_call("web_search", args).allows_execution
+        controller.after_call("web_search", args, '{"error":"failed"}', failed=True)
+    blocked = controller.before_call("web_search", args)
+    assert blocked.code == "repeated_exact_failure_block"
+
+    # A fresh turn resets failure observations, and a correction is allowed.
+    fresh = ToolCallGuardrailController(config)
+    fresh.after_call("web_search", args, '{"error":"failed"}', failed=True)
+    assert fresh.before_call("web_search", {"query": "corrected"}).allows_execution
+    assert not fresh.after_call("web_search", {"query": "corrected"}, '{"ok":true}', failed=False).should_halt
+    for _ in range(config.no_progress_block_after + 2):
+        assert fresh.before_call("read_file", {"path": "same"}).allows_execution
+        assert not fresh.after_call("read_file", {"path": "same"}, "same content", failed=False).should_halt
+    assert fresh.before_call("read_file", {"path": "same"}).allows_execution
+
+
+def test_failure_only_config_uses_existing_same_tool_failure_threshold():
+    config = ToolCallGuardrailConfig.from_mapping({"failure_hard_stop_enabled": True})
+    controller = ToolCallGuardrailController(config)
+    for index in range(config.same_tool_failure_halt_after):
+        decision = controller.after_call("web_search", {"query": str(index)}, '{"error":"failed"}', failed=True)
+    assert decision.code == "same_tool_failure_halt"
+    assert decision.should_halt
+
+
 def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(

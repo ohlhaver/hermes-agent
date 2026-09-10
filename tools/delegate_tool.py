@@ -1403,6 +1403,7 @@ def _build_child_agent(
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._tool_failure_fallback = getattr(parent_agent, "_tool_failure_fallback", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""

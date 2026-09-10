@@ -10428,6 +10428,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reply_to_is_own_message=event.reply_to_is_own_message,
                         auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
+                        metadata=dict(event.metadata or {}),
                         internal=event.internal,
                         timestamp=event.timestamp,
                     )
@@ -12927,6 +12928,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                tool_failure_fallback=(event.metadata or {}).get("tool_failure_fallback"),
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -18751,6 +18753,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        tool_failure_fallback: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18769,6 +18772,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                tool_failure_fallback=tool_failure_fallback,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18780,6 +18784,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                tool_failure_fallback=tool_failure_fallback,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -18901,6 +18906,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        tool_failure_fallback: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20351,6 +20357,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            # Rebind on cached agents too; a later request must not inherit another locale.
+            agent._tool_failure_fallback = (
+                tool_failure_fallback.strip()
+                if isinstance(tool_failure_fallback, str) and 0 < len(tool_failure_fallback.strip()) <= 512
+                else None
+            )
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
@@ -21905,6 +21918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_tool_failure_fallback = tool_failure_fallback
                 next_session_key = session_key
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
@@ -21937,6 +21951,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_tool_failure_fallback = (getattr(pending_event, "metadata", None) or {}).get("tool_failure_fallback")
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -21978,6 +21993,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    tool_failure_fallback=next_tool_failure_fallback,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

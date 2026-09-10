@@ -6159,6 +6159,42 @@ class AIAgent:
             "to change strategy instead of repeating the same call."
         )
 
+    def _finish_tool_guardrail_halt(self, messages: list) -> str:
+        """Finish both pre-dispatch argument failures and executed-tool halts."""
+        decision = self._tool_guardrail_halt_decision
+        if self._tool_guardrails.config.failure_hard_stop_enabled:
+            from agent.chat_completion_helpers import handle_max_iterations
+            final_response = handle_max_iterations(self, messages, self.iteration_budget.used, failure_halt=True)
+        else:
+            final_response = self._toolguard_controlled_halt_response(decision)
+        if not self._tool_guardrails.config.failure_hard_stop_enabled:
+            self._emit_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+        if not messages or messages[-1] != {"role": "assistant", "content": final_response}:
+            messages.append({"role": "assistant", "content": final_response})
+        if final_response:
+            self._safe_print(f"\n{final_response}\n")
+            if self.stream_delta_callback:
+                try:
+                    self.stream_delta_callback(final_response)
+                    self.stream_delta_callback(None)
+                except Exception:
+                    pass
+        return final_response
+
+    def _guardrail_invalid_tool_arguments(self, tool_name: str, raw_arguments, result: str) -> str:
+        """Route rejected argument shapes through the existing opt-in failure guard.
+
+        No tool ran. The controller retains only a hash of this signature, and
+        the default warning/all-hard-stop behavior of other consumers is kept.
+        """
+        if not self._tool_guardrails.config.failure_hard_stop_enabled:
+            return result
+        signature_args = {"invalid_arguments": raw_arguments}
+        decision = self._tool_guardrails.before_call(tool_name, signature_args)
+        if not decision.allows_execution:
+            return self._guardrail_block_result(decision)
+        return self._append_guardrail_observation(tool_name, signature_args, result, failed=True)
+
     def _append_guardrail_observation(
         self,
         tool_name: str,
