@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -163,12 +163,20 @@ class TestStoredPromptReuse:
             {"role": "assistant", "content": "Keep this answer"},
         ]
         before = deepcopy(history)
-        _restore_or_build_system_prompt(agent, None, history)
+        with (
+            patch("hermes_cli.plugins.invoke_hook") as invoke_hook,
+            patch(
+                "agent.credits_tracker.seed_credits_at_session_start"
+            ) as seed_credits,
+        ):
+            _restore_or_build_system_prompt(agent, None, history)
 
         assert agent._cached_system_prompt == stamp_system_prompt_contract(
             rebuilt, _CONTRACT_B
         )
         assert history == before
+        invoke_hook.assert_not_called()
+        seed_credits.assert_not_called()
         db.update_system_prompt.assert_called_once_with(
             agent.session_id, agent._cached_system_prompt
         )
@@ -230,7 +238,13 @@ class TestLegitimateFreshBuild:
         db = MagicMock()
         agent = _make_agent(session_db=db)
 
-        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+        with (
+            caplog.at_level(logging.WARNING, logger="agent.conversation_loop"),
+            patch("hermes_cli.plugins.invoke_hook") as invoke_hook,
+            patch(
+                "agent.credits_tracker.seed_credits_at_session_start"
+            ) as seed_credits,
+        ):
             _restore_or_build_system_prompt(agent, None, [])
 
         # No history → DB read skipped entirely
@@ -244,6 +258,13 @@ class TestLegitimateFreshBuild:
             agent.session_id,
             stamp_system_prompt_contract("BUILT_PROMPT", _CONTRACT_A),
         )
+        invoke_hook.assert_called_once_with(
+            "on_session_start",
+            session_id=agent.session_id,
+            model=agent.model,
+            platform=agent.platform,
+        )
+        seed_credits.assert_called_once_with(agent)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_no_db_skips_persistence(self):
