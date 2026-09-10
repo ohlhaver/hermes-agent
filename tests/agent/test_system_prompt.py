@@ -3,7 +3,11 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.system_prompt import build_system_prompt_parts
+from agent.system_prompt import (
+    build_system_prompt_candidate,
+    build_system_prompt_parts,
+    extract_system_prompt_contract,
+)
 
 
 def _make_agent(**overrides):
@@ -58,6 +62,73 @@ class TestContextFileCwd:
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert _captured_context_cwd(_make_agent()) == tmp_path
+
+
+class TestSystemPromptContractFingerprint:
+    def _candidate(self, agent, *, soul="", context="", system_message=None):
+        with (
+            patch("run_agent.load_soul_md", return_value=soul),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=context),
+        ):
+            return build_system_prompt_candidate(agent, system_message)
+
+    def test_platform_hint_override_changes_contract_fingerprint(self):
+        before = _make_agent(
+            platform="api_server",
+            _platform_hint_overrides={"api_server": {"append": "Old route rule"}},
+        )
+        after = _make_agent(
+            platform="api_server",
+            _platform_hint_overrides={"api_server": {"append": "New route rule"}},
+        )
+
+        old_prompt, old_fingerprint, _ = self._candidate(before)
+        new_prompt, new_fingerprint, _ = self._candidate(after)
+
+        assert old_fingerprint != new_fingerprint
+        assert extract_system_prompt_contract(old_prompt) == old_fingerprint
+        assert extract_system_prompt_contract(new_prompt) == new_fingerprint
+
+    def test_soul_and_caller_input_change_contract_fingerprint(self):
+        agent = _make_agent(load_soul_identity=True, skip_context_files=True)
+
+        _, old_fingerprint, _ = self._candidate(
+            agent, soul="Old SOUL", system_message="Old caller input"
+        )
+        _, new_fingerprint, _ = self._candidate(
+            agent, soul="New SOUL", system_message="New caller input"
+        )
+
+        assert old_fingerprint != new_fingerprint
+
+    def test_volatile_runtime_footer_does_not_change_contract_fingerprint(self):
+        agent = _make_agent(model="model-a", provider="provider-a")
+        _, first_fingerprint, _ = self._candidate(agent)
+
+        agent.model = "model-b"
+        agent.provider = "provider-b"
+        _, second_fingerprint, _ = self._candidate(agent)
+
+        assert first_fingerprint == second_fingerprint
+
+    def test_live_coding_snapshot_does_not_churn_unchanged_contract(self):
+        agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
+
+        with patch(
+            "agent.coding_context.coding_system_blocks",
+            return_value=["Git snapshot from turn one"],
+        ):
+            first_prompt, first_fingerprint, _ = self._candidate(agent)
+        with patch(
+            "agent.coding_context.coding_system_blocks",
+            return_value=["Git snapshot after local edits"],
+        ):
+            second_prompt, second_fingerprint, _ = self._candidate(agent)
+
+        assert first_prompt != second_prompt
+        assert first_fingerprint == second_fingerprint
 
 
 def _stable_prompt(agent):

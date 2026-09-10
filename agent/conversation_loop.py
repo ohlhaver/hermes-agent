@@ -62,6 +62,10 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.system_prompt import (
+    build_system_prompt_contract_fingerprint,
+    extract_system_prompt_contract,
+)
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -350,16 +354,24 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    current_contract_fingerprint = None
+    if stored_prompt:
+        current_contract_fingerprint, _ = build_system_prompt_contract_fingerprint(
+            agent, system_message
+        )
+
+    if stored_prompt and _stored_prompt_matches_runtime(
+        agent, stored_prompt, current_contract_fingerprint
+    ):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
         return
     if stored_prompt:
-        stored_state = "stale_runtime"
+        stored_state = "stale_contract_or_runtime"
         logger.info(
-            "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
+            "Stored system prompt for session %s has stale runtime identity "
+            "or prompt contract; rebuilding for model=%s provider=%s.",
             agent.session_id,
             getattr(agent, "model", "") or "",
             getattr(agent, "provider", "") or "",
@@ -380,34 +392,37 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
+    is_new_session = not conversation_history
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
-    # Plugin hook: on_session_start — fired once when a brand-new
-    # session is created (not on continuation).  Plugins can use this
-    # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if is_new_session:
+        # Plugin hook: on_session_start — fired once when a brand-new
+        # session is created (not on continuation).  Plugins can use this
+        # to initialise session-scoped state (e.g. warm a memory cache).
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
 
-    # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
-    # desktop build seeds at session OPEN (see seed_credits_at_session_start in
-    # tui_gateway), so this call is usually a no-op there (idempotent: skips when
-    # _credits_state already exists). For the plain CLI / any path that didn't seed
-    # at build, it primes credits state from /api/oauth/account (or a fixture) on the
-    # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+        # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
+        # desktop build seeds at session OPEN (see seed_credits_at_session_start in
+        # tui_gateway), so this call is usually a no-op there (idempotent: skips when
+        # _credits_state already exists). For the plain CLI / any path that didn't seed
+        # at build, it primes credits state from /api/oauth/account (or a fixture) on the
+        # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
+
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -425,8 +440,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
 
-def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted Model/Provider lines are stale."""
+def _stored_prompt_matches_runtime(
+    agent,
+    prompt: str,
+    current_contract_fingerprint: Optional[str],
+) -> bool:
+    """Return False when runtime identity or effective prompt inputs changed."""
 
     def line_value(label: str) -> str:
         prefix = f"{label}:"
@@ -446,7 +465,12 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
 
-    return True
+    stored_contract_fingerprint = extract_system_prompt_contract(prompt)
+    return bool(
+        stored_contract_fingerprint
+        and current_contract_fingerprint
+        and stored_contract_fingerprint == current_contract_fingerprint
+    )
 
 
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:

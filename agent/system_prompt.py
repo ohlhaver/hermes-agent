@@ -23,9 +23,10 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
@@ -48,6 +49,13 @@ from agent.prompt_builder import (
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
+
+
+_PROMPT_CONTRACT_MARKER_PREFIX = "<!-- hermes-system-prompt-contract-sha256:"
+_PROMPT_CONTRACT_MARKER_SUFFIX = " -->"
+# Bump when hardcoded prompt guidance changes outside the resolved identity,
+# platform, context, or tool/config inputs recorded below.
+_SYSTEM_PROMPT_CONTRACT_VERSION = 1
 
 
 def _ra():
@@ -142,6 +150,44 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     if not is_truthy_value(os.getenv("HERMES_DESKTOP_TERMINAL")):
         return hint
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
+
+
+def _effective_platform_hint(agent: Any) -> str:
+    """Resolve the exact platform guidance included in a prompt."""
+    platform_key = (agent.platform or "").lower().strip()
+    default_hint = ""
+    if platform_key in PLATFORM_HINTS:
+        default_hint = PLATFORM_HINTS[platform_key]
+    elif platform_key:
+        try:
+            from gateway.platform_registry import platform_registry
+
+            entry = platform_registry.get(platform_key)
+            if entry and entry.platform_hint:
+                default_hint = entry.platform_hint
+        except Exception:
+            pass
+
+    if platform_key == "telegram" and default_hint:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            telegram_extra = (
+                ((config.get("platforms") or {}).get("telegram") or {}).get("extra")
+                or {}
+            )
+            if telegram_extra.get("rich_messages"):
+                default_hint = (
+                    default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
+                )
+        except Exception:
+            pass
+
+    effective_hint = _resolve_platform_hint(agent, platform_key, default_hint)
+    if platform_key == "tui" and effective_hint:
+        effective_hint = _tui_embedded_pane_clarifier(effective_hint)
+    return effective_hint
 
 
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
@@ -415,41 +461,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             f"after explicit direction."
         )
 
-    platform_key = (agent.platform or "").lower().strip()
-    # Resolve the built-in/plugin default hint for this platform, then apply
-    # any per-platform override from config (platform_hints.<platform>).
-    _default_hint = ""
-    if platform_key in PLATFORM_HINTS:
-        _default_hint = PLATFORM_HINTS[platform_key]
-    elif platform_key:
-        # Check plugin registry for platform-specific LLM guidance
-        try:
-            from gateway.platform_registry import platform_registry
-            _entry = platform_registry.get(platform_key)
-            if _entry and _entry.platform_hint:
-                _default_hint = _entry.platform_hint
-        except Exception:
-            pass
-
-    # For Telegram: append the rich-messages extension only when the user has
-    # opted in to ``platforms.telegram.extra.rich_messages: true``.  The base
-    # hint covers MarkdownV2-compatible constructs; the extension adds Bot API
-    # 10.1 guidance (tables, task lists, math, collapsible details, etc.).
-    if platform_key == "telegram" and _default_hint:
-        try:
-            from hermes_cli.config import load_config_readonly
-            _cfg = load_config_readonly()
-            _tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {}
-            if _tg_extra.get("rich_messages"):
-                _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
-        except Exception:
-            pass  # Config read failure — fall back to base hint only
-
-    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
-    if platform_key == "tui" and _effective_hint:
-        _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
-    if _effective_hint:
-        stable_parts.append(_effective_hint)
+    effective_hint = _effective_platform_hint(agent)
+    if effective_hint:
+        stable_parts.append(effective_hint)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
@@ -524,6 +538,131 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
+def _system_prompt_contract_fingerprint(contract: str) -> str:
+    """Hash effective contract inputs, excluding per-session metadata.
+
+    The contract payload tracks identity/SOUL, platform guidance, tool/config
+    inputs, caller input, discovered context files, and an explicit version for
+    other hardcoded guidance. The volatile tier is deliberately excluded so
+    date and memory snapshots do not churn an otherwise valid conversation
+    prefix. Model and provider are checked independently by the restore path.
+    """
+    return hashlib.sha256(contract.encode("utf-8")).hexdigest()
+
+
+def extract_system_prompt_contract(prompt: str) -> Optional[str]:
+    """Return the persisted prompt-contract digest, if it is well formed."""
+    if not isinstance(prompt, str):
+        return None
+    for line in reversed(prompt.splitlines()):
+        if not (
+            line.startswith(_PROMPT_CONTRACT_MARKER_PREFIX)
+            and line.endswith(_PROMPT_CONTRACT_MARKER_SUFFIX)
+        ):
+            continue
+        digest = line[
+            len(_PROMPT_CONTRACT_MARKER_PREFIX):-len(_PROMPT_CONTRACT_MARKER_SUFFIX)
+        ]
+        if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+            return digest
+        return None
+    return None
+
+
+def stamp_system_prompt_contract(prompt: str, fingerprint: str) -> str:
+    """Append the machine-readable contract digest to a prompt snapshot."""
+    if len(fingerprint) != 64 or any(
+        char not in "0123456789abcdef" for char in fingerprint
+    ):
+        raise ValueError("system prompt contract fingerprint must be lowercase SHA-256")
+    marker = (
+        f"{_PROMPT_CONTRACT_MARKER_PREFIX}{fingerprint}"
+        f"{_PROMPT_CONTRACT_MARKER_SUFFIX}"
+    )
+    return f"{prompt.rstrip()}\n\n{marker}" if prompt else marker
+
+
+def build_system_prompt_candidate(
+    agent: Any,
+    system_message: Optional[str] = None,
+) -> Tuple[str, str, List[str]]:
+    """Build one prompt snapshot plus its stable contract fingerprint.
+
+    Returning truncation warnings keeps their user-visible emission with the
+    caller that activates this prompt.
+    """
+    fingerprint, _ = build_system_prompt_contract_fingerprint(
+        agent, system_message=system_message
+    )
+    parts = build_system_prompt_parts(agent, system_message=system_message)
+    joined = "\n\n".join(
+        part for part in (parts["stable"], parts["context"], parts["volatile"])
+        if part
+    )
+    prompt = stamp_system_prompt_contract(joined, fingerprint)
+    return prompt, fingerprint, drain_truncation_warnings()
+
+
+def build_system_prompt_contract_fingerprint(
+    agent: Any,
+    system_message: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    """Hash effective persisted instruction inputs without volatile state.
+
+    Persisted-prompt validation must not reload memory-provider prompt blocks
+    or rebuild live coding/environment snapshots on every continuation. A full
+    prompt is built solely when this contract or runtime identity changed.
+    """
+    runtime = _ra()
+    context_length: Optional[int] = None
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_length = getattr(compressor, "context_length", None)
+    if isinstance(compressor_length, int) and compressor_length > 0:
+        context_length = compressor_length
+
+    soul_loaded = False
+    identity = ""
+    if agent.load_soul_identity or not agent.skip_context_files:
+        identity = runtime.load_soul_md(context_length) or ""
+        soul_loaded = bool(identity)
+    if not identity:
+        identity = DEFAULT_AGENT_IDENTITY
+
+    context_files_prompt = ""
+    if not agent.skip_context_files:
+        context_files_prompt = runtime.build_context_files_prompt(
+            cwd=resolve_context_cwd(),
+            skip_soul=soul_loaded,
+            context_length=context_length,
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+        ) or ""
+
+    contract = json.dumps(
+        {
+            "version": _SYSTEM_PROMPT_CONTRACT_VERSION,
+            "identity": identity.strip(),
+            "platform_hint": _effective_platform_hint(agent).strip(),
+            "system_message": (system_message or "").strip(),
+            "context_files": context_files_prompt.strip(),
+            "tool_names": sorted(agent.valid_tool_names),
+            "task_completion_guidance": getattr(
+                agent, "_task_completion_guidance", True
+            ),
+            "parallel_tool_call_guidance": getattr(
+                agent, "_parallel_tool_call_guidance", True
+            ),
+            "tool_use_enforcement": agent._tool_use_enforcement,
+            "kanban_worker_guidance": getattr(
+                agent, "_kanban_worker_guidance", None
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _system_prompt_contract_fingerprint(contract), drain_truncation_warnings()
+
+
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full system prompt from all layers.
 
@@ -539,15 +678,17 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     mid-session, which is the only way to keep upstream prompt caches
     warm across turns.
     """
-    parts = build_system_prompt_parts(agent, system_message=system_message)
-    joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    prompt, fingerprint, warnings = build_system_prompt_candidate(
+        agent, system_message=system_message
+    )
+    agent._system_prompt_contract_fingerprint = fingerprint
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
-    for warning in drain_truncation_warnings():
+    for warning in warnings:
         agent._emit_status(warning)
 
-    return joined
+    return prompt
 
 
 def invalidate_system_prompt(agent: Any) -> None:
@@ -587,7 +728,11 @@ def format_tools_for_system_message(agent: Any) -> str:
 
 __all__ = [
     "build_system_prompt_parts",
+    "build_system_prompt_candidate",
+    "build_system_prompt_contract_fingerprint",
     "build_system_prompt",
+    "extract_system_prompt_contract",
+    "stamp_system_prompt_contract",
     "invalidate_system_prompt",
     "format_tools_for_system_message",
 ]
