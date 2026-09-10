@@ -941,8 +941,50 @@ async def test_run_agent_streaming_does_not_enable_completed_interim_commentary(
         },
     )
 
-    assert result.get("already_sent") is True
+    assert result.get("already_sent") is not True
     assert not any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+class ToolRoundStreamAgent:
+    """Native token callbacks may precede the decision to call a tool."""
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        callback = self.stream_delta_callback
+        if callback:
+            callback("I must follow the instruction before answering.")
+            callback(None)  # Native conversation loop's tool boundary.
+            callback("Another intermediate tool-round fragment.")
+            callback(None)
+            callback('```python\ndef add(a, b):\n    return a + b\n```\n')
+            callback('"Hello world" — Die Funktion addiert beide Werte.')
+        return {
+            "final_response": '```python\ndef add(a, b):\n    return a + b\n```\n"Hello world" — Die Funktion addiert beide Werte.',
+            "messages": [],
+            "api_calls": 3,
+        }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_interim_off_discards_tool_round_stream_content(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, ToolRoundStreamAgent,
+        session_id="sess-tool-round-stream",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert result["final_response"] == ToolRoundStreamAgent().run_conversation("unused")["final_response"]
+    assert 'def add(a, b):' in result["final_response"]
+    assert '"Hello world"' in result["final_response"]
+    assert result.get("already_sent") is not True
 
 
 @pytest.mark.asyncio
@@ -1042,7 +1084,7 @@ async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
         StreamingRefineAgent,
         session_id="sess-matrix-streaming",
         config_data={
-            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
             "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
         },
         platform=Platform.MATRIX,
@@ -1094,7 +1136,7 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
         TransformedStreamAgent,
         session_id="sess-transformed-stream",
         config_data={
-            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
             "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
         },
         platform=Platform.MATRIX,

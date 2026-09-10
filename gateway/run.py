@@ -20003,7 +20003,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
+            # Token content can precede tool-call/continuation classification.
+            # With interim messages off, use the existing authoritative final
+            # response delivery instead of publishing unclassified previews.
+            _want_stream_deltas = _streaming_enabled and interim_assistant_messages_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
