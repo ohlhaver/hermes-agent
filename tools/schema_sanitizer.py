@@ -38,9 +38,44 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def summarize_request_tools(api_kwargs: dict, api_mode: str) -> dict:
+    """Project tool identities at pre-dispatch, without schema or message data.
+
+    Unknown shapes are incomplete evidence, never evidence that a tool is absent.
+    This describes the prepared request, not provider acceptance or execution.
+    """
+    if api_mode not in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
+        return {"names": [], "count": None, "complete": False}
+    container = api_kwargs
+    key = "tools"
+    if api_mode == "bedrock_converse":
+        container = api_kwargs.get("toolConfig", {})
+    if not isinstance(container, dict):
+        return {"names": [], "count": None, "complete": False}
+    entries = container.get(key, [])
+    if not isinstance(entries, list):
+        return {"names": [], "count": None, "complete": False}
+    names = []
+    complete = len(entries) <= 4096
+    for entry in entries[:4096]:
+        spec = entry
+        if isinstance(entry, dict):
+            if api_mode == "chat_completions":
+                spec = entry.get("function") if entry.get("type") == "function" else None
+            elif api_mode == "bedrock_converse":
+                spec = entry.get("toolSpec")
+        name = spec.get("name") if isinstance(spec, dict) else None
+        if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", name):
+            names.append(name)
+        else:
+            complete = False
+    return {"names": names, "count": len(entries), "complete": complete}
 
 
 def sanitize_tool_schemas(tools: list[dict]) -> list[dict]:
