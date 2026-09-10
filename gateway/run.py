@@ -19952,6 +19952,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cfg_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+            if not interim_assistant_messages_enabled:
+                # The model must know the delivery contract. Otherwise a report
+                # beside a housekeeping call can be followed by only "see above",
+                # even though that earlier assistant text was never delivered.
+                combined_ephemeral = (combined_ephemeral + "\n\n" + (
+                    "Only your final response is delivered to the user. Assistant text before or "
+                    "alongside tool calls is not shown. After all tools, including housekeeping, "
+                    "put the complete requested answer in your final response, including requested "
+                    "results, code and quotations in the conversation language. Do not replace "
+                    "the answer with a reference to an earlier assistant message from this turn. "
+                    "Keep internal work notes and rule-following commentary out of the final answer."
+                )).strip()
 
             max_iterations = _current_max_iterations()
 
