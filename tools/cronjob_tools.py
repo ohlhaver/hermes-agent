@@ -869,6 +869,7 @@ def cronjob(
                 # Never update the stored job or copy the caller's conversation.
                 execution_job = {
                     **job,
+                    "_execution_output_requirements": True,
                     "prompt": (
                         str(job.get("prompt") or "")
                         + "\n\nOutput requirements for this execution only "

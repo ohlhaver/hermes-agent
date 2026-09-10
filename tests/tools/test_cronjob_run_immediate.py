@@ -52,6 +52,9 @@ class TestCronjobRunExecutesImmediately:
             first = json.loads(cronjob(action="run", job_id=saved_job["id"], prompt=constraint))
             second = json.loads(cronjob(action="run", job_id=saved_job["id"]))
         first_job, second_job = [call.args[0] for call in run.call_args_list]
+        assert first_job["_execution_output_requirements"] is True
+        assert "_execution_output_requirements" not in second_job
+        assert "_execution_output_requirements" not in saved_job
         assert first_job["prompt"].startswith(_JOB["prompt"] + "\n\n")
         assert "take precedence over conflicting saved output instructions" in first_job["prompt"]
         assert constraint in _build_job_prompt(first_job)

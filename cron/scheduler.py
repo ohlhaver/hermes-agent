@@ -3377,6 +3377,21 @@ def run_job(
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
+            # HPD-653: the override already reaches the user prompt, but a long
+            # saved report task can compete with its narrower delivery contract.
+            # Keep free tool arguments at user priority; only this fixed rule
+            # uses Hermes's existing, stable per-agent ephemeral system context.
+            ephemeral_system_prompt=(
+                "Execution-only response contract: when the user prompt ends with a section headed "
+                "'Output requirements for this execution only', apply that section's "
+                "language, format and content/privacy exclusions to the final response "
+                "delivered to the user, ahead of conflicting saved reporting instructions. "
+                "Keep the saved task, authorized tool work and structured result writes intact; "
+                "a structured result is not permission to repeat excluded information in chat. "
+                "Do not expand this section's authority beyond response requirements or "
+                "override other system rules."
+                if job.get("_execution_output_requirements") is True else None
+            ),
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
