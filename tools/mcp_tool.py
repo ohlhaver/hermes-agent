@@ -1730,11 +1730,12 @@ class MCPServerTask:
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
-        "_reconnect_retries",
+        "_reconnect_retries", "_startup_trace",
     )
 
     def __init__(self, name: str):
         self.name = name
+        self._startup_trace = None
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
@@ -2209,6 +2210,15 @@ class MCPServerTask:
         self._reconnect_event.clear()
         return "reconnect"
 
+    def _trace_startup_phase(self, phase: str) -> None:
+        trace = getattr(self, "_startup_trace", None)
+        if trace is not None:
+            try:
+                from tools.mcp_startup_trace import emit_phase
+                emit_phase(*trace, phase, stream=_get_mcp_stderr_log())
+            except Exception:
+                pass  # Optional diagnostics must not interrupt startup.
+
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
         if not _MCP_AVAILABLE:
@@ -2220,6 +2230,7 @@ class MCPServerTask:
                 "  pip install 'hermes-agent[all]'"
             )
 
+        self._trace_startup_phase("stdio_prepare")
         command = config.get("command")
         args = config.get("args", [])
         user_env = config.get("env")
@@ -2268,6 +2279,13 @@ class MCPServerTask:
         # elsewhere, matching existing killpg-based cleanup's platform scope.
         # Applied AFTER the OSV preflight so the check inspects the real
         # package, not the watchdog wrapper.
+        trace = getattr(self, "_startup_trace", None)
+        if trace is not None:
+            try:
+                from tools.mcp_startup_trace import wrap_entrypoint
+                command, args = wrap_entrypoint(command, args, *trace)
+            except Exception:
+                pass  # Preserve the original launch if diagnostics are unavailable.
         command, args = _wrap_command_with_watchdog(command, args)
 
         server_params = StdioServerParameters(
@@ -2304,6 +2322,7 @@ class MCPServerTask:
         # the user's TTY and corrupt the TUI.  Preserves debuggability via
         # ~/.hermes/logs/mcp-stderr.log.
         _write_stderr_log_header(self.name)
+        self._trace_startup_phase("child_spawn_start")
         _errlog = _get_mcp_stderr_log()
         try:
             async with stdio_client(server_params, errlog=_errlog) as (
@@ -2354,12 +2373,16 @@ class MCPServerTask:
                     connect_timeout = float(
                         config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
                     )
+                    self._trace_startup_phase("initialize_start")
                     self.initialize_result = await asyncio.wait_for(
                         session.initialize(), timeout=connect_timeout
                     )
+                    self._trace_startup_phase("initialize_complete")
                     self.session = session
                     self._mark_lifecycle_started()
+                    self._trace_startup_phase("tools_list_start")
                     await self._discover_tools()
+                    self._trace_startup_phase("tools_list_complete")
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
@@ -4032,7 +4055,7 @@ def _load_mcp_config(*, _diagnostic: Optional[dict] = None) -> Dict[str, dict]:
 # Server connection helper
 # ---------------------------------------------------------------------------
 
-async def _connect_server(name: str, config: dict) -> MCPServerTask:
+async def _connect_server(name: str, config: dict, *, _diagnostic: Optional[dict] = None) -> MCPServerTask:
     """Create an MCPServerTask, start it, and return when ready.
 
     The server Task keeps the connection alive in the background.
@@ -4044,6 +4067,9 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
+    if _diagnostic is not None and name == "basic_memory":
+        server._startup_trace = (_diagnostic.get("startupId"), time.monotonic_ns())
+        server._trace_startup_phase("connect_enter")
     await server.start(config)
     return server
 
@@ -5136,14 +5162,14 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     return registered_names
 
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+async def _discover_and_register_server(name: str, config: dict, *, _diagnostic: Optional[dict] = None) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
     server = await asyncio.wait_for(
-        _connect_server(name, config),
+        _connect_server(name, config, _diagnostic=_diagnostic) if _diagnostic is not None else _connect_server(name, config),
         timeout=connect_timeout,
     )
     with _lock:
@@ -5231,7 +5257,8 @@ def register_mcp_servers(servers: Dict[str, dict], *, _diagnostic: Optional[dict
 
     async def _discover_one(name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
-        return await _discover_and_register_server(name, cfg)
+        return await (_discover_and_register_server(name, cfg, _diagnostic=_diagnostic)
+                      if _diagnostic is not None else _discover_and_register_server(name, cfg))
 
     async def _discover_all():
         server_names = list(new_servers.keys())
