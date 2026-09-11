@@ -71,6 +71,8 @@ class ToolCallGuardrailConfig:
 
     warnings_enabled: bool = True
     hard_stop_enabled: bool = False
+    # Opt into existing failure stops without blocking successful repeated reads.
+    failure_hard_stop_enabled: bool = False
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
@@ -97,6 +99,9 @@ class ToolCallGuardrailConfig:
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
+            failure_hard_stop_enabled=_as_bool(
+                data.get("failure_hard_stop_enabled"), defaults.failure_hard_stop_enabled,
+            ),
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
@@ -240,7 +245,7 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        if not self.config.hard_stop_enabled:
+        if not (self.config.hard_stop_enabled or self.config.failure_hard_stop_enabled):
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         exact_count = self._exact_failure_counts.get(signature, 0)
@@ -260,7 +265,7 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
+        if self.config.hard_stop_enabled and self._is_idempotent(tool_name):
             record = self._no_progress.get(signature)
             if record is not None:
                 _result_hash, repeat_count = record
@@ -303,7 +308,7 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
+            if (self.config.hard_stop_enabled or self.config.failure_hard_stop_enabled) and same_count >= self.config.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(
                     action="halt",
                     code="same_tool_failure_halt",

@@ -1900,15 +1900,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure_halt: bool = False) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+    if not failure_halt:
+        print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_request = (
         "You've reached the maximum number of tool-calling iterations allowed. "
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
+    if failure_halt:
+        messages = list(messages)  # The completion instruction is API-only, never persisted user text.
+        # Reuse native tool-free completion, but never resume tool execution or
+        # retry this final explanation. The ordinary iteration-limit path stays intact.
+        summary_request = (
+            "Repeated attempts at the same step failed, so tool execution has stopped for this request. "
+            "Give a brief, friendly final response in the conversation's language. "
+            "Explain what could not be completed and any useful next step, without claiming success. "
+            "Do not expose internal guardrail codes, counters, or implementation diagnostics. "
+            "Preserve useful results and technical content the user actually requested. "
+            "Do not call tools or promise to continue automatically."
+        )
+    failure_fallback = getattr(agent, "_tool_failure_fallback", None) or "I couldn't complete this step after repeated errors. You can send a new request."
     messages.append({"role": "user", "content": summary_request})
 
     try:
@@ -2010,7 +2024,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            if failure_halt:
+                from agent.codex_runtime import run_codex_stream
+                summary_response = run_codex_stream(
+                    agent, codex_kwargs, emit_callbacks=False, max_stream_retries=0,
+                )
+            else:
+                summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -2097,7 +2117,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if final_response:
                 messages.append({"role": "assistant", "content": final_response})
             else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+                final_response = failure_fallback if failure_halt else "I reached the iteration limit and couldn't generate a summary."
+        elif failure_halt:
+            final_response = failure_fallback
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
@@ -2140,13 +2162,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if final_response:
                     messages.append({"role": "assistant", "content": final_response})
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = failure_fallback if failure_halt else "I reached the iteration limit and couldn't generate a summary."
             else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+                final_response = failure_fallback if failure_halt else "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = failure_fallback if failure_halt else f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
     return final_response
 

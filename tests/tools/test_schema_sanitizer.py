@@ -8,16 +8,42 @@ Unrecognized schema: "object"`` errors on local inference backends.
 from __future__ import annotations
 
 import copy
+import pytest
 
 from tools.schema_sanitizer import (
     sanitize_tool_schemas,
     strip_pattern_and_format,
     strip_slash_enum,
+    summarize_request_tools,
 )
 
 
 def _tool(name: str, parameters: dict) -> dict:
     return {"type": "function", "function": {"name": name, "parameters": parameters}}
+
+
+@pytest.mark.parametrize("mode,kwargs", [
+    ("chat_completions", {"tools": [_tool("skill_view", {"description": "PRIVATE_SCHEMA"})]}),
+    ("codex_responses", {"tools": [{"type": "function", "name": "skill_view", "parameters": {"secret": "PRIVATE_SCHEMA"}}]}),
+    ("anthropic_messages", {"tools": [{"name": "skill_view", "input_schema": {"secret": "PRIVATE_SCHEMA"}}]}),
+    ("bedrock_converse", {"toolConfig": {"tools": [{"toolSpec": {"name": "skill_view", "description": "PRIVATE_SCHEMA"}}]}}),
+])
+def test_request_tool_projection_does_not_retain_schema_or_messages(mode, kwargs):
+    kwargs["messages"] = [{"content": "PRIVATE_MESSAGE"}]
+    before = copy.deepcopy(kwargs)
+    assert summarize_request_tools(kwargs, mode) == {"names": ["skill_view"], "count": 1, "complete": True}
+    assert kwargs == before
+
+
+@pytest.mark.parametrize("kwargs,mode,expected", [
+    ({}, "chat_completions", {"names": [], "count": 0, "complete": True}),
+    ({"tools": None}, "chat_completions", {"names": [], "count": None, "complete": False}),
+    ({}, "unknown", {"names": [], "count": None, "complete": False}),
+    ({"tools": [{"type": "web_search"}]}, "chat_completions", {"names": [], "count": 1, "complete": False}),
+    ({"tools": [{"name": "invalid name with contents"}]}, "anthropic_messages", {"names": [], "count": 1, "complete": False}),
+])
+def test_request_tool_projection_marks_unrecognized_shapes_incomplete(kwargs, mode, expected):
+    assert summarize_request_tools(kwargs, mode) == expected
 
 
 def test_object_without_properties_gets_empty_properties():

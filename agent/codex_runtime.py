@@ -1176,7 +1176,7 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None, *, emit_callbacks=True, max_stream_retries=1):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1188,19 +1188,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries = 1
+    # Failure-only final explanations disable emissions/retries: their caller
+    # owns the one final visible reply, including when the transport fails.
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
+        if emit_callbacks:
+            agent._fire_stream_delta(text)
 
     def _on_reasoning_delta(text: str) -> None:
-        agent._fire_reasoning_delta(text)
+        if emit_callbacks:
+            agent._fire_reasoning_delta(text)
 
     def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
+        if emit_callbacks:
+            agent._fire_streamed_codex_commentary(text)
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.

@@ -1356,6 +1356,7 @@ def run_conversation(
                         invoke_hook as _invoke_hook,
                     )
                     if has_hook("pre_api_request"):
+                        from tools.schema_sanitizer import summarize_request_tools
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -1378,6 +1379,12 @@ def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        # HPD-629: observe the actual final request and this
+                        # parent context, without modifying either one.
+                        _delegation_diagnostic = None
+                        if agent.platform == "heyhermes_web":
+                            from tools.delegation_diagnostic import summarize_delegation_request
+                            _delegation_diagnostic = summarize_delegation_request(api_kwargs, agent.api_mode, agent)
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -1397,6 +1404,8 @@ def run_conversation(
                             else [],
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
+                            request_tool_exposure=summarize_request_tools(api_kwargs, agent.api_mode),
+                            delegation_diagnostic=_delegation_diagnostic,
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
@@ -4837,6 +4846,7 @@ def run_conversation(
                 # Validate tool call arguments are valid JSON
                 # Handle empty strings as empty objects (common model quirk)
                 invalid_json_args = []
+                invalid_json_call_ids = set()
                 for tc in assistant_message.tool_calls:
                     args = tc.function.arguments
                     if isinstance(args, (dict, list)):
@@ -4861,6 +4871,7 @@ def run_conversation(
                             # broken args trigger the whole-turn JSON retry.
                             continue
                         invalid_json_args.append((tc.function.name, str(e)))
+                        invalid_json_call_ids.add(tc.id)
                 
                 if invalid_json_args:
                     # Check if the invalid JSON is due to truncation rather
@@ -4891,6 +4902,28 @@ def run_conversation(
                             "partial": True,
                             "error": "Response truncated due to output length limit",
                         }
+
+                    # Failure-only opt-in also observes failures rejected before
+                    # tool dispatch, using the same native thresholds/controller.
+                    invalid_feedback = {}
+                    for tc in assistant_message.tool_calls:
+                        if tc.id in invalid_json_call_ids:
+                            invalid_feedback[tc.id] = agent._guardrail_invalid_tool_arguments(
+                                tc.function.name, tc.function.arguments,
+                                "Error: Invalid JSON arguments. Please retry with valid JSON.",
+                            )
+                    if agent._tool_guardrail_halt_decision is not None:
+                        while messages and isinstance(messages[-1], dict) and messages[-1].get("_thinking_prefill"):
+                            messages.pop()
+                        messages.append(agent._build_assistant_message(assistant_message, finish_reason))
+                        for tc in assistant_message.tool_calls:
+                            messages.append({
+                                "role": "tool", "name": tc.function.name, "tool_call_id": tc.id,
+                                "content": invalid_feedback.get(tc.id, "Skipped: another tool call had invalid JSON."),
+                            })
+                        _turn_exit_reason = "guardrail_halt"
+                        final_response = agent._finish_tool_guardrail_halt(messages)
+                        break
 
                     # Track retries for invalid JSON arguments
                     agent._invalid_json_retries += 1
@@ -5096,26 +5129,8 @@ def run_conversation(
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if agent._tool_guardrail_halt_decision is not None:
-                    decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
-                    final_response = agent._toolguard_controlled_halt_response(decision)
-                    agent._emit_status(
-                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
-                    )
-                    messages.append({"role": "assistant", "content": final_response})
-                    # Emit the halt message to the client so it's not
-                    # indistinguishable from a crash.  The stream display
-                    # was flushed (callback(None)) before tool execution,
-                    # but the callback is still alive — fire the text
-                    # through it so SSE/TUI clients see the explanation.
-                    if final_response:
-                        agent._safe_print(f"\n{final_response}\n")
-                        if agent.stream_delta_callback:
-                            try:
-                                agent.stream_delta_callback(final_response)
-                                agent.stream_delta_callback(None)
-                            except Exception:
-                                pass
+                    final_response = agent._finish_tool_guardrail_halt(messages)
                     break
 
                 # Reset per-turn retry counters after successful tool

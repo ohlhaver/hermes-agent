@@ -1403,6 +1403,7 @@ def _build_child_agent(
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._tool_failure_fallback = getattr(parent_agent, "_tool_failure_fallback", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -3401,9 +3402,13 @@ def _build_top_level_description() -> str:
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
         "- Parallel independent workstreams (research A and B simultaneously)\n\n"
-        "WHEN NOT TO USE (use these instead):\n"
+        "Platform or conversation instructions may require delegation by default, "
+        "including mechanical work or a single slow tool call. Follow that "
+        "foreground policy before applying the general efficiency guidance below.\n\n"
+        "WHEN TO KEEP WORK INLINE (only if the foreground policy permits it):\n"
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
-        "- Single tool call -> just call the tool directly\n"
+        "- Single short tool call -> call the tool directly\n\n"
+        "CAPABILITY LIMITS (still apply when delegation is the default):\n"
         "- Tasks needing user interaction -> subagents cannot use clarify\n"
         "- Durable long-running work that must outlive the current turn -> "
         "use cronjob (action='create') or terminal(background=True, "
