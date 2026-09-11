@@ -4370,10 +4370,11 @@ class TestRunConversation:
 
     def test_tool_exposure_hook_uses_post_middleware_request_despite_payload_truncation(self, agent):
         self._setup_agent(agent)
+        agent.platform = "heyhermes_web"
         agent.client.chat.completions.create.return_value = _mock_response(content="Done", finish_reason="stop")
         calls = []
         final_tools = [{"type": "function", "function": {
-            "name": "skill_view", "description": "PRIVATE_SCHEMA", "parameters": {"type": "object"},
+            "name": "delegate_task", "description": "PRIVATE_SCHEMA", "parameters": {"type": "object"},
         }}]
 
         def middleware(payload, **_kwargs):
@@ -4393,9 +4394,15 @@ class TestRunConversation:
         prepared = [kw for name, kw in calls if name == "pre_api_request"]
         assert len(prepared) == 1
         assert prepared[0]["request"] == {"truncated": True}
-        assert prepared[0]["request_tool_exposure"] == {"names": ["skill_view"], "count": 1, "complete": True}
+        assert prepared[0]["request_tool_exposure"] == {"names": ["delegate_task"], "count": 1, "complete": True}
         assert agent.client.chat.completions.create.call_args.kwargs["tools"] == final_tools
         assert agent.tools != final_tools
+
+        diagnostic = prepared[0]["delegation_diagnostic"]
+        assert diagnostic["present"] is True
+        assert diagnostic["parentPresent"] is True
+        assert len(diagnostic["schemaSha256"]) == 64
+        assert "PRIVATE" not in str(diagnostic)
 
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False

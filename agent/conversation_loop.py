@@ -1379,6 +1379,12 @@ def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        # HPD-629: observe the actual final request and this
+                        # parent context, without modifying either one.
+                        _delegation_diagnostic = None
+                        if agent.platform == "heyhermes_web":
+                            from tools.delegation_diagnostic import summarize_delegation_request
+                            _delegation_diagnostic = summarize_delegation_request(api_kwargs, agent.api_mode, agent)
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -1399,6 +1405,7 @@ def run_conversation(
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
                             request_tool_exposure=summarize_request_tools(api_kwargs, agent.api_mode),
+                            delegation_diagnostic=_delegation_diagnostic,
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
