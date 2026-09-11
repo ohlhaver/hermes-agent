@@ -3982,7 +3982,7 @@ def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     return safe_servers
 
 
-def _load_mcp_config() -> Dict[str, dict]:
+def _load_mcp_config(*, _diagnostic: Optional[dict] = None) -> Dict[str, dict]:
     """Read ``mcp_servers`` from the Hermes config file.
 
     Returns a dict of ``{server_name: server_config}`` or empty dict.
@@ -3998,9 +3998,15 @@ def _load_mcp_config() -> Dict[str, dict]:
         from utils import env_var_enabled as _env_enabled
 
         if _env_enabled("HERMES_SAFE_MODE"):
+            if _diagnostic is not None:
+                _diagnostic["phase"] = "safe_mode"
             return {}
         config = load_config()
         servers = config.get("mcp_servers")
+        if _diagnostic is not None:
+            _diagnostic.update(configLoaded=True,
+                configuredServerCount=len(servers) if isinstance(servers, dict) else 0,
+                basicMemoryConfigured=isinstance(servers, dict) and "basic_memory" in servers)
         if not servers or not isinstance(servers, dict):
             return {}
         # Ensure .env vars are available for interpolation
@@ -4016,6 +4022,8 @@ def _load_mcp_config() -> Dict[str, dict]:
                 safe_servers[name] = interpolated
         return safe_servers
     except Exception as exc:
+        if _diagnostic is not None:
+            _diagnostic.update(phase="config_failed", configLoaded=False, errorClass="configuration")
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
 
@@ -5159,7 +5167,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(servers: Dict[str, dict], *, _diagnostic: Optional[dict] = None) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -5212,8 +5220,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _signal_reconnect(srv)
 
     if not new_servers:
+        if _diagnostic is not None:
+            _diagnostic["failedServerCount"] = 0
         return _existing_tool_names()
 
+    if _diagnostic is not None:
+        _diagnostic["failedServerCount"] = 0
     # Start the background event loop for MCP connections
     _ensure_mcp_loop()
 
@@ -5232,6 +5244,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             if isinstance(result, BaseException):
                 command = new_servers.get(name, {}).get("command")
                 message = _format_connect_error(result)
+                if _diagnostic is not None:
+                    # Never retain exception messages, server names or command paths.
+                    _diagnostic["failedServerCount"] += 1
+                    category = ("timeout" if isinstance(result, TimeoutError) else
+                                "import" if isinstance(result, ImportError) else
+                                "discovery")
+                    previous = _diagnostic.get("errorClass", "none")
+                    _diagnostic["errorClass"] = category if previous in {"none", category} else "multiple"
                 with _lock:
                     _server_connecting.discard(name)
                     _server_connect_errors[name] = message
@@ -5279,7 +5299,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(*, _diagnostic: Optional[dict] = None) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -5291,12 +5311,18 @@ def discover_mcp_tools() -> List[str]:
     Returns:
         List of all registered MCP tool names.
     """
+    if _diagnostic is not None:
+        _diagnostic["sdkAvailable"] = _MCP_AVAILABLE
     if not _MCP_AVAILABLE:
+        if _diagnostic is not None:
+            _diagnostic.update(phase="sdk_unavailable", errorClass="import")
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
 
-    servers = _load_mcp_config()
+    servers = _load_mcp_config(_diagnostic=_diagnostic) if _diagnostic is not None else _load_mcp_config()
     if not servers:
+        if _diagnostic is not None and _diagnostic["phase"] == "starting":
+            _diagnostic["phase"] = "no_servers"
         logger.debug("No MCP servers configured")
         return []
 
@@ -5307,7 +5333,14 @@ def discover_mcp_tools() -> List[str]:
             if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
-    tool_names = register_mcp_servers(servers)
+    if _diagnostic is not None:
+        _diagnostic.update(phase="discovery", discoveryAttempted=True,
+            enabledServerCount=sum(_parse_boolish(cfg.get("enabled", True), default=True) for cfg in servers.values()))
+    tool_names = (register_mcp_servers(servers, _diagnostic=_diagnostic)
+                  if _diagnostic is not None else register_mcp_servers(servers))
+    if _diagnostic is not None:
+        _diagnostic.update(phase="complete", registeredToolCount=len(tool_names),
+            basicMemoryToolCount=sum(name.startswith("mcp__basic_memory__") for name in tool_names))
     if not new_server_names:
         return tool_names
 

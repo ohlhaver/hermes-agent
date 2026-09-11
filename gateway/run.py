@@ -22426,6 +22426,35 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+async def _discover_gateway_mcp(runner) -> None:
+    """Retain content-free startup evidence on the runner serving requests."""
+    from uuid import uuid4
+
+    diagnostic = {
+        "startupId": uuid4().hex, "phase": "starting", "errorClass": "none",
+        "sdkAvailable": None, "configLoaded": None,
+        "basicMemoryConfigured": None, "discoveryAttempted": False,
+        "configuredServerCount": None, "enabledServerCount": None,
+        "registeredToolCount": None, "basicMemoryToolCount": None,
+        "failedServerCount": None,
+    }
+    runner._mcp_startup_diagnostic = dict(diagnostic)
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: discover_mcp_tools(_diagnostic=diagnostic)
+        )
+    except Exception as exc:
+        diagnostic["phase"] = "failed"
+        diagnostic["errorClass"] = (
+            "import" if isinstance(exc, ImportError) else
+            "timeout" if isinstance(exc, TimeoutError) else "other"
+        )
+        logger.debug("MCP tool discovery failed: %s", exc)
+    finally:
+        runner._mcp_startup_diagnostic = dict(diagnostic)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -22835,12 +22864,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # internally; calling it from the loop thread would freeze platform
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
-    try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+    await _discover_gateway_mcp(runner)
 
     # Start the gateway
     success = await runner.start()
