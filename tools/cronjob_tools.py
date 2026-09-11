@@ -1019,7 +1019,7 @@ Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
-For action='run', pass the current user's output requirements (language, format, privacy or content exclusions) in prompt. These apply only to that execution, not the saved job or future runs. Do not copy the full conversation.
+For action='run', copy the current user's output requirements (language, format, privacy or content exclusions) verbatim into prompt; do not paraphrase them into a different task. These constrain the delivered response only: 'do not display' does not mean 'do not read or process'. Preserve the saved task's authorized tool work and structured result writes. Never invent a work prohibition or replace the task with a technical-only simulation. These requirements apply only to that execution, not the saved job or future runs. Do not copy the full conversation.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
@@ -1041,7 +1041,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "prompt": {
                 "type": "string",
-                "description": "For create: the full self-contained prompt. If skills are also provided, this becomes the task instruction paired with those skills. For run: additional output instructions for this execution only; include current user constraints that the saved job does not know. The saved task remains in effect and these instructions override conflicting saved output requirements."
+                "description": "For create: the full self-contained prompt. If skills are also provided, this becomes the task instruction paired with those skills. For run: copy the user's output requirements verbatim, without inventing restrictions on reading, processing or task execution. Restrict the delivered response, not the saved task's authorized tools or structured result writes. These instructions override conflicting saved output requirements for this execution only."
             },
             "schedule": {
                 "type": "string",
