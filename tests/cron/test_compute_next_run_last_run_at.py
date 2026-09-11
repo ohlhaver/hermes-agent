@@ -85,3 +85,26 @@ class TestCronComputeNextRunUsesLastRunAt:
         interval_dt = datetime.fromisoformat(interval_result)
         assert cron_dt > last_run, f"Cron next {cron_dt} should be after last_run {last_run}"
         assert interval_dt > last_run, f"Interval next {interval_dt} should be after last_run {last_run}"
+
+
+@pytest.mark.parametrize("use_last_run", [False, True])
+@pytest.mark.parametrize("minute", [0, 15])
+@pytest.mark.parametrize("before, expected", [
+    ("2026-03-28T17:16:00", "2026-03-29T08:{minute}:00+02:00"),
+    ("2026-10-24T17:16:00", "2026-10-25T08:{minute}:00+01:00"),
+])
+def test_fixed_defaults_stay_local_across_zurich_dst(monkeypatch, minute, before, expected, use_last_run):
+    zone = ZoneInfo("Europe/Zurich")
+    now = datetime.fromisoformat(before).replace(tzinfo=zone)
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+    schedule = {"kind": "cron", "expr": f"{minute} 8,17 * * *"}
+    result = compute_next_run(schedule, last_run_at=now.isoformat() if use_last_run else None)
+    morning = expected.format(minute=f"{minute:02d}")
+    assert result == morning
+    # Completion timestamps are stored with offsets, then read back into the
+    # configured zone. The evening and following morning must not drift either.
+    evening = compute_next_run(schedule, last_run_at=result)
+    assert evening == morning.replace("T08:", "T17:")
+    following = compute_next_run(schedule, last_run_at=evening)
+    from datetime import timedelta
+    assert following == (datetime.fromisoformat(morning) + timedelta(days=1)).isoformat()
