@@ -1235,6 +1235,52 @@ class TestEditOverflowSplitAndDeliver:
 
 class TestInterimCommentaryMessages:
     @pytest.mark.asyncio
+    async def test_platform_can_route_commentary_away_from_answer_send(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        class NativeActivityAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True), Platform.TELEGRAM)
+                self.commentary = []
+                self.sent = []
+
+            async def connect(self, *, is_reconnect=False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {"name": chat_id, "type": "dm"}
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent.append(content)
+                return SendResult(success=True, message_id="answer")
+
+            async def send_commentary(
+                self, chat_id, content, reply_to=None, metadata=None,
+            ):
+                self.commentary.append(content)
+                return SendResult(success=True, message_id="activity")
+
+        adapter = NativeActivityAdapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+
+        consumer.on_commentary("I'll inspect the repository first.")
+        consumer.on_delta("Done.")
+        consumer.finish()
+        await consumer.run()
+
+        assert adapter.commentary == ["I'll inspect the repository first."]
+        assert adapter.sent == ["Done."]
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
     async def test_commentary_message_stays_separate_from_final_stream(self):
         adapter = MagicMock()
         adapter.send = AsyncMock(side_effect=[

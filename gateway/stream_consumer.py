@@ -1418,7 +1418,16 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
-            result = await self.adapter.send(
+            # BasePlatformAdapter exposes a dedicated commentary seam so
+            # native activity surfaces can consume interim narration without
+            # turning it into final-answer text. Duck-typed test/legacy
+            # adapters retain the historical send() path.
+            send_commentary = (
+                self.adapter.send_commentary
+                if isinstance(self.adapter, _BasePlatformAdapter)
+                else self.adapter.send
+            )
+            result = await send_commentary(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self.metadata,
