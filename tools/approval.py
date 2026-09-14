@@ -2043,6 +2043,8 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_execution_notify_cbs: dict[str, object] = {}
+_gateway_execution_receipts: dict[str, set[str]] = {}
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2057,6 +2059,13 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
+def register_gateway_execution_notify(session_key: str, cb) -> None:
+    """Register the exact-run callback for an approved action's real outcome."""
+    with _lock:
+        _gateway_execution_notify_cbs[session_key] = cb
+        _gateway_execution_receipts.setdefault(session_key, set())
+
+
 def unregister_gateway_notify(session_key: str) -> None:
     """Unregister the per-session gateway approval callback.
 
@@ -2065,9 +2074,53 @@ def unregister_gateway_notify(session_key: str) -> None:
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_execution_notify_cbs.pop(session_key, None)
+        _gateway_execution_receipts.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
+
+
+def notify_gateway_execution(
+    session_key: str,
+    execution: dict,
+    *,
+    outcome: str,
+    exit_code: Optional[int] = None,
+) -> bool:
+    """Report one redacted terminal outcome for one bound approval action.
+
+    The runtime approval id is the idempotency key.  Mark it before invoking
+    the transport callback so duplicate terminal return paths cannot publish a
+    second receipt.  The receiver remains idempotent as the network boundary.
+    """
+    if outcome not in {"executed", "failed"} or not isinstance(execution, dict):
+        return False
+    receipt_id = str(execution.get("idempotencyKey") or "").strip()
+    payload_hash = str(execution.get("payloadHash") or "").strip()
+    key = str(execution.get("key") or "").strip()
+    if not receipt_id or not payload_hash or not key:
+        return False
+    with _lock:
+        callback = _gateway_execution_notify_cbs.get(session_key)
+        delivered = _gateway_execution_receipts.setdefault(session_key, set())
+        if callback is None or receipt_id in delivered:
+            return False
+        delivered.add(receipt_id)
+    try:
+        callback({
+            "execution": {
+                "key": key,
+                "payloadHash": payload_hash,
+                "idempotencyKey": receipt_id,
+            },
+            "outcome": outcome,
+            "exitCode": exit_code,
+        })
+        return True
+    except Exception as exc:
+        logger.warning("Gateway approval execution receipt failed: %s", exc)
+        return False
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -3167,7 +3220,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+        "execution": entry.data.get("execution"),
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -3516,7 +3574,8 @@ def check_all_command_guards(command: str, env_type: str,
                         save_permanent_allowlist(_permanent_approved)
 
             return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+                    "user_approved": True, "description": combined_desc,
+                    "execution": decision.get("execution")}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat. Redact secrets in the

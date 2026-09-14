@@ -20654,6 +20654,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The callback bridges sync→async to send the approval request
             # to the user immediately.
             from tools.approval import (
+                register_gateway_execution_notify,
                 register_gateway_notify,
                 reset_current_session_key,
                 set_current_session_key,
@@ -20693,13 +20694,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_metadata = dict(_status_thread_metadata or {})
+                        _approval_metadata["approval"] = {
+                            "patternKey": approval_data.get("pattern_key"),
+                            "patternKeys": approval_data.get("pattern_keys"),
+                            "description": desc,
+                        }
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
@@ -20711,6 +20718,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             raise RuntimeError("send_exec_approval: loop unavailable")
                         _approval_result = _approval_fut.result(timeout=15)
                         if _approval_result.success:
+                            # Native approval adapters may bind the UI card to
+                            # this exact runtime waiter.  The binding travels
+                            # back through the guard and terminal executor, so
+                            # the card is only marked executed after the real
+                            # command has returned.
+                            if getattr(
+                                type(_status_adapter),
+                                "send_exec_approval_outcome",
+                                None,
+                            ) is not None:
+                                _raw = getattr(_approval_result, "raw_response", None)
+                                _request = (
+                                    _raw.get("approvalRequest")
+                                    if isinstance(_raw, dict)
+                                    else None
+                                )
+                                _execution = (
+                                    _request.get("execution")
+                                    if isinstance(_request, dict)
+                                    else None
+                                )
+                                if not (
+                                    isinstance(_execution, dict)
+                                    and _execution.get("key")
+                                    and _execution.get("payloadHash")
+                                    and _execution.get("idempotencyKey")
+                                ):
+                                    raise RuntimeError(
+                                        "native approval response omitted its execution binding"
+                                    )
+                                approval_data["execution"] = dict(_execution)
                             return
                         logger.warning(
                             "Button-based approval failed (send returned error), falling back to text: %s",
@@ -20748,6 +20786,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _approval_send_fut.result(timeout=15)
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
+
+            def _approval_execution_notify_sync(receipt: dict) -> None:
+                """Deliver one real command outcome to a native adapter."""
+                if getattr(
+                    type(_status_adapter),
+                    "send_exec_approval_outcome",
+                    None,
+                ) is None:
+                    return
+                _last_error = None
+                for _attempt in range(3):
+                    try:
+                        _receipt_fut = safe_schedule_threadsafe(
+                            _status_adapter.send_exec_approval_outcome(
+                                chat_id=_status_chat_id,
+                                session_key=_approval_session_key,
+                                receipt=receipt,
+                                metadata=_status_thread_metadata,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="approval execution receipt scheduling error",
+                        )
+                        if _receipt_fut is None:
+                            raise RuntimeError("approval execution receipt: loop unavailable")
+                        _receipt_result = _receipt_fut.result(timeout=15)
+                        if getattr(_receipt_result, "success", False):
+                            return
+                        _last_error = getattr(_receipt_result, "error", None)
+                    except Exception as _exc:
+                        _last_error = _exc
+                raise RuntimeError(
+                    f"approval execution receipt delivery failed: {_last_error}"
+                )
 
             # Keep real user text separate from API-only recovery guidance.  If
             # an auto-continue note is prepended below, persist the original
@@ -20895,6 +20967,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            register_gateway_execution_notify(
+                _approval_session_key,
+                _approval_execution_notify_sync,
+            )
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal

@@ -2363,6 +2363,27 @@ class TestApprovalTimeoutIsNotConsent:
         assert "NOT consented" in r["message"]
         assert "rephrase" in r["message"].lower()
 
+    def test_native_execution_binding_returns_with_the_exact_decision(self, monkeypatch):
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch, seconds=5)
+        binding = {
+            "key": "runtime-exact",
+            "payloadHash": "c" * 64,
+            "idempotencyKey": "runtime-exact",
+        }
+
+        def notify(data):
+            data["execution"] = dict(binding)
+            assert mod.resolve_gateway_approval(self.SESSION_KEY, "once") == 1
+
+        mod.register_gateway_notify(self.SESSION_KEY, notify)
+        result = mod.check_all_command_guards("rm -rf .git", "local")
+
+        assert result["approved"] is True
+        assert result["user_approved"] is True
+        assert result["execution"] == binding
+
     def test_timeout_emits_post_hook_with_timeout_outcome(self, monkeypatch):
         """Plugins must be able to distinguish timeout from explicit deny.
 
@@ -2561,3 +2582,31 @@ class TestApprovalPromptRedaction:
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+
+def test_gateway_execution_receipt_is_exact_and_idempotent():
+    from tools import approval as approval_mod
+
+    session_key = "receipt-exact-session"
+    received = []
+    binding = {
+        "key": "runtime-approval-1",
+        "payloadHash": "a" * 64,
+        "idempotencyKey": "runtime-approval-1",
+    }
+    approval_mod.register_gateway_execution_notify(session_key, received.append)
+    try:
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is True
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is False
+    finally:
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert received == [{
+        "execution": binding,
+        "outcome": "executed",
+        "exitCode": 0,
+    }]

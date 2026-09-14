@@ -86,6 +86,36 @@ def test_non_approved_command_still_interrupts_on_stale_bit(monkeypatch):
     assert "[Command interrupted]" in result["output"]
 
 
+def test_approved_command_reports_real_terminal_outcome_once(monkeypatch):
+    from tools import approval as approval_mod
+
+    session_key = "approved-outcome-session"
+    binding = {
+        "key": "runtime-approved-command",
+        "payloadHash": "b" * 64,
+        "idempotencyKey": "runtime-approved-command",
+    }
+    received = []
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {
+        "approved": True,
+        "user_approved": True,
+        "description": "test action",
+        "execution": binding,
+    })
+    approval_mod.register_gateway_execution_notify(session_key, received.append)
+    try:
+        result = json.loads(tt.terminal_tool(command="true", task_id=session_key))
+    finally:
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert result["exit_code"] == 0
+    assert received == [{
+        "execution": binding,
+        "outcome": "executed",
+        "exitCode": 0,
+    }]
+
+
 def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
     """The clean-slate clear must NOT make approved commands un-interruptible:
     an interrupt that arrives after execution starts still SIGINTs (130)."""

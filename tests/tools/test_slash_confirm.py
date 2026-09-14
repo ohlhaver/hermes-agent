@@ -66,6 +66,24 @@ class TestRegisterAndGetPending:
 
 class TestResolve:
     @pytest.mark.asyncio
+    async def test_resolve_with_status_distinguishes_empty_success_from_stale(self):
+        calls = []
+
+        async def handler(choice):
+            calls.append(choice)
+            return None
+
+        slash_confirm.register("sess1", "cid1", "reload-mcp", handler)
+        resolved, result = await slash_confirm.resolve_with_status("sess1", "cid1", "cancel")
+        assert resolved is True
+        assert result is None
+        assert calls == ["cancel"]
+
+        stale, stale_result = await slash_confirm.resolve_with_status("sess1", "cid1", "cancel")
+        assert stale is False
+        assert stale_result is None
+
+    @pytest.mark.asyncio
     async def test_resolve_runs_handler_and_pops_entry(self):
         calls = []
 

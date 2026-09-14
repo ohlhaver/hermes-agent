@@ -2140,6 +2140,9 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
+    _approval_execution = None
+    _approval_execution_outcome = None
+    _approval_execution_exit_code = None
     try:
         if not isinstance(command, str):
             logger.warning(
@@ -2416,6 +2419,8 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
                 _approved_run = True
+                if isinstance(approval.get("execution"), dict):
+                    _approval_execution = approval["execution"]
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
@@ -2694,8 +2699,14 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
+                if _approval_execution is not None:
+                    _approval_execution_outcome = "executed"
+                    _approval_execution_exit_code = 0
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
+                if _approval_execution is not None:
+                    _approval_execution_outcome = "failed"
+                    _approval_execution_exit_code = -1
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
@@ -2739,6 +2750,9 @@ def terminal_tool(
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
+                        if _approval_execution is not None:
+                            _approval_execution_outcome = "failed"
+                            _approval_execution_exit_code = 124
                         return json.dumps({
                             "output": "",
                             "exit_code": 124,
@@ -2756,6 +2770,9 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                    if _approval_execution is not None:
+                        _approval_execution_outcome = "failed"
+                        _approval_execution_exit_code = -1
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
@@ -2894,12 +2911,18 @@ def terminal_tool(
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
 
+            if _approval_execution is not None:
+                _approval_execution_outcome = "executed" if returncode == 0 else "failed"
+                _approval_execution_exit_code = int(returncode)
             return json.dumps(result_dict, ensure_ascii=False)
 
     except Exception as e:
         import traceback
         tb_str = traceback.format_exc()
         logger.error("terminal_tool exception:\n%s", tb_str)
+        if _approval_execution is not None:
+            _approval_execution_outcome = "failed"
+            _approval_execution_exit_code = -1
         return json.dumps({
             "output": "",
             "exit_code": -1,
@@ -2907,6 +2930,25 @@ def terminal_tool(
             "traceback": tb_str,
             "status": "error"
         }, ensure_ascii=False)
+    finally:
+        if _approval_execution is not None:
+            if _approval_execution_outcome is None:
+                _approval_execution_outcome = "failed"
+                _approval_execution_exit_code = -1
+            try:
+                from tools.approval import notify_gateway_execution
+
+                notify_gateway_execution(
+                    locals().get("session_key", "") or (task_id or ""),
+                    _approval_execution,
+                    outcome=_approval_execution_outcome,
+                    exit_code=_approval_execution_exit_code,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to publish the approved command execution receipt",
+                    exc_info=True,
+                )
 
 
 def check_terminal_requirements() -> bool:
