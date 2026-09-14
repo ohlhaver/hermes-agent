@@ -1165,10 +1165,11 @@ def _execute_remote(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def execute_code(
+def _execute_code_impl(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    _approval_state: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1218,6 +1219,38 @@ def execute_code(
             "tool_calls_made": 0,
             "duration_seconds": 0,
         }, ensure_ascii=False)
+
+    _execution = _guard.get("execution")
+    if isinstance(_execution, dict):
+        from tools.approval import register_gateway_tool_execution
+
+        _execution_session_key = str(
+            _guard.get("execution_session_key") or task_id or ""
+        )
+        _execution_claim = (
+            "execute_code:"
+            + str(_execution.get("idempotencyKey") or "").strip()
+        )
+        if not register_gateway_tool_execution(
+            _execution_session_key,
+            _execution_claim,
+            _execution,
+        ):
+            return json.dumps({
+                "status": "error",
+                "error": (
+                    "Approved execute_code script was not executed because its "
+                    "native approval outcome channel is unavailable."
+                ),
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }, ensure_ascii=False)
+        if _approval_state is not None:
+            _approval_state.update({
+                "session_key": _execution_session_key,
+                "execution": dict(_execution),
+                "claim": _execution_claim,
+            })
 
     # Clean interrupt slate for a user-approved script before EITHER dispatch
     # path spawns it: drop a stale bit that landed on this thread during the
@@ -1620,6 +1653,82 @@ def execute_code(
                 os.unlink(sock_path)
         except OSError:
             pass  # already cleaned up or never created
+
+
+def _execute_code_outcome(result: Any) -> tuple[str, Optional[int]]:
+    """Derive the native approval receipt from execute_code's real result."""
+    try:
+        parsed = json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        return "failed", -1
+    if not isinstance(parsed, dict):
+        return "failed", -1
+    exit_code = parsed.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        exit_code = None
+    status = str(parsed.get("status") or "").strip().lower()
+    failed_statuses = {
+        "error", "failed", "timeout", "interrupted", "cancelled",
+        "blocked", "disabled", "pending_approval", "approval_required",
+    }
+    failed = (
+        bool(parsed.get("error"))
+        or status in failed_statuses
+        or parsed.get("success") is False
+        or (exit_code is not None and exit_code != 0)
+    )
+    return ("failed" if failed else "executed"), exit_code
+
+
+def execute_code(
+    code: str,
+    task_id: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
+) -> str:
+    """Run execute_code and close any exact native approval with its outcome."""
+    approval_state: Dict[str, Any] = {}
+    try:
+        result = _execute_code_impl(
+            code,
+            task_id=task_id,
+            enabled_tools=enabled_tools,
+            _approval_state=approval_state,
+        )
+    except BaseException:
+        if approval_state:
+            try:
+                from tools.approval import complete_gateway_tool_execution
+
+                complete_gateway_tool_execution(
+                    approval_state["claim"],
+                    outcome="failed",
+                    exit_code=-1,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to publish the approved execute_code outcome",
+                    exc_info=True,
+                )
+        raise
+
+    if approval_state:
+        outcome, exit_code = _execute_code_outcome(result)
+        try:
+            from tools.approval import complete_gateway_tool_execution
+
+            delivered = complete_gateway_tool_execution(
+                approval_state["claim"],
+                outcome=outcome,
+                exit_code=exit_code,
+            )
+            if not delivered:
+                logger.warning("Approved execute_code outcome was not delivered")
+        except Exception:
+            logger.warning(
+                "Failed to publish the approved execute_code outcome",
+                exc_info=True,
+            )
+    return result
 
 
 def _kill_process_group(proc, escalate: bool = False):
