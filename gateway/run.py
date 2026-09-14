@@ -353,6 +353,31 @@ def _redact_approval_command(cmd: "str | None") -> str:
     return redact_sensitive_text(str(cmd or ""), force=True)
 
 
+class _NativeApprovalContractError(RuntimeError):
+    """A native approval card cannot be tied to an exact execution outcome."""
+
+
+def _native_approval_execution_binding(send_result: object) -> dict:
+    """Extract and validate the exact-run binding from a successful send."""
+    raw = getattr(send_result, "raw_response", None)
+    request = raw.get("approvalRequest") if isinstance(raw, dict) else None
+    execution = request.get("execution") if isinstance(request, dict) else None
+    if not isinstance(execution, dict):
+        raise _NativeApprovalContractError(
+            "native approval response omitted its execution binding"
+        )
+    binding = {
+        "key": str(execution.get("key") or "").strip(),
+        "payloadHash": str(execution.get("payloadHash") or "").strip(),
+        "idempotencyKey": str(execution.get("idempotencyKey") or "").strip(),
+    }
+    if not all(binding.values()):
+        raise _NativeApprovalContractError(
+            "native approval response returned an invalid execution binding"
+        )
+    return binding
+
+
 def _format_exec_approval_fallback(
     command: str,
     description: str,
@@ -20693,6 +20718,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Check the *class* for the method, not the instance — avoids
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
+                    _has_exact_outcome = getattr(
+                        type(_status_adapter),
+                        "send_exec_approval_outcome",
+                        None,
+                    ) is not None
+                    if _has_exact_outcome:
+                        approval_data["execution_required"] = True
+                    _approval_result = None
+
+                    def _cancel_native_wait(reason: str) -> None:
+                        """Best-effort close of a card whose binding is unusable."""
+                        _cancel_method = getattr(
+                            type(_status_adapter),
+                            "cancel_exec_approval",
+                            None,
+                        )
+                        if _cancel_method is None:
+                            return
+                        try:
+                            _cancel_fut = safe_schedule_threadsafe(
+                                _status_adapter.cancel_exec_approval(
+                                    chat_id=_status_chat_id,
+                                    session_key=_approval_session_key,
+                                    message_id=getattr(
+                                        _approval_result,
+                                        "message_id",
+                                        None,
+                                    ),
+                                    metadata=_status_thread_metadata,
+                                    reason=reason,
+                                ),
+                                _loop_for_step,
+                                logger=logger,
+                                log_message="cancel_exec_approval scheduling error",
+                            )
+                            if _cancel_fut is not None:
+                                _cancel_fut.result(timeout=15)
+                        except Exception as _cancel_exc:
+                            logger.warning(
+                                "Failed to cancel unusable native approval card: %s",
+                                _cancel_exc,
+                            )
+
                     try:
                         _approval_metadata = dict(_status_thread_metadata or {})
                         _approval_metadata["approval"] = {
@@ -20723,38 +20791,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # back through the guard and terminal executor, so
                             # the card is only marked executed after the real
                             # command has returned.
-                            if getattr(
-                                type(_status_adapter),
-                                "send_exec_approval_outcome",
-                                None,
-                            ) is not None:
-                                _raw = getattr(_approval_result, "raw_response", None)
-                                _request = (
-                                    _raw.get("approvalRequest")
-                                    if isinstance(_raw, dict)
-                                    else None
-                                )
-                                _execution = (
-                                    _request.get("execution")
-                                    if isinstance(_request, dict)
-                                    else None
-                                )
-                                if not (
-                                    isinstance(_execution, dict)
-                                    and _execution.get("key")
-                                    and _execution.get("payloadHash")
-                                    and _execution.get("idempotencyKey")
-                                ):
-                                    raise RuntimeError(
-                                        "native approval response omitted its execution binding"
+                            if _has_exact_outcome:
+                                try:
+                                    approval_data["execution"] = (
+                                        _native_approval_execution_binding(_approval_result)
                                     )
-                                approval_data["execution"] = dict(_execution)
+                                except _NativeApprovalContractError:
+                                    _cancel_native_wait("invalid_execution_binding")
+                                    raise
                             return
+                        if _has_exact_outcome:
+                            raise _NativeApprovalContractError(
+                                "native approval card delivery failed; action not executable"
+                            )
                         logger.warning(
                             "Button-based approval failed (send returned error), falling back to text: %s",
                             _approval_result.error,
                         )
                     except Exception as _e:
+                        if _has_exact_outcome:
+                            # Exact-outcome adapters must never create a second
+                            # text prompt while a native card may still be live.
+                            # If scheduling timed out the send is ambiguous, so
+                            # close it best-effort and fail the gate closed.
+                            if not (
+                                isinstance(_e, _NativeApprovalContractError)
+                                and getattr(_approval_result, "success", False)
+                            ):
+                                _cancel_native_wait("native_approval_unavailable")
+                            raise
                         logger.warning(
                             "Button-based approval failed, falling back to text: %s", _e
                         )

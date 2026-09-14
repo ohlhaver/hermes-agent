@@ -2141,6 +2141,8 @@ def terminal_tool(
         # Note: force parameter is internal only, not exposed to model API
     """
     _approval_execution = None
+    _approval_execution_session_key = ""
+    _approval_execution_claim = ""
     _approval_execution_outcome = None
     _approval_execution_exit_code = None
     try:
@@ -2421,6 +2423,9 @@ def terminal_tool(
                 _approved_run = True
                 if isinstance(approval.get("execution"), dict):
                     _approval_execution = approval["execution"]
+                    _approval_execution_session_key = str(
+                        approval.get("execution_session_key") or ""
+                    )
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
@@ -2457,6 +2462,44 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+
+        if _approval_execution is not None:
+            from tools.approval import register_gateway_tool_execution
+
+            _receipt_session_key = _approval_execution_session_key or session_key
+            _approval_execution_claim = (
+                "terminal:"
+                + str(_approval_execution.get("idempotencyKey") or "").strip()
+            )
+            if not register_gateway_tool_execution(
+                _receipt_session_key,
+                _approval_execution_claim,
+                _approval_execution,
+            ):
+                _approval_execution_outcome = "failed"
+                _approval_execution_exit_code = -1
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Approved command was not executed because its native "
+                        "approval outcome channel is unavailable."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
+            if background:
+                _approval_execution_outcome = "failed"
+                _approval_execution_exit_code = -1
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Approved background commands cannot yet report their real "
+                        "terminal outcome to the native approval card. Run this "
+                        "approved command in the foreground instead."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2699,9 +2742,6 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
-                if _approval_execution is not None:
-                    _approval_execution_outcome = "executed"
-                    _approval_execution_exit_code = 0
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
                 if _approval_execution is not None:
@@ -2936,14 +2976,26 @@ def terminal_tool(
                 _approval_execution_outcome = "failed"
                 _approval_execution_exit_code = -1
             try:
-                from tools.approval import notify_gateway_execution
+                if _approval_execution_claim:
+                    from tools.approval import complete_gateway_tool_execution
 
-                notify_gateway_execution(
-                    locals().get("session_key", "") or (task_id or ""),
-                    _approval_execution,
-                    outcome=_approval_execution_outcome,
-                    exit_code=_approval_execution_exit_code,
-                )
+                    complete_gateway_tool_execution(
+                        _approval_execution_claim,
+                        outcome=_approval_execution_outcome,
+                        exit_code=_approval_execution_exit_code,
+                    )
+                else:
+                    # Validation can fail after approval but before the normal
+                    # outcome claim is registered. Close that exact card as
+                    # not executed rather than leaving an orphan waiter.
+                    from tools.approval import notify_gateway_execution
+
+                    notify_gateway_execution(
+                        _approval_execution_session_key or (task_id or ""),
+                        _approval_execution,
+                        outcome="failed",
+                        exit_code=-1,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to publish the approved command execution receipt",
