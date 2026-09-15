@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Collection, Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -1022,6 +1022,45 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _emit_tool_bridge_json_error_hook(
+    function_args: Dict[str, Any],
+    scoped_names: Collection[str],
+    turn_id: Optional[str],
+    api_request_id: Optional[str],
+) -> None:
+    """Report a rejected nested JSON string without exposing its contents."""
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        if not has_hook("tool_bridge_error"):
+            return
+        raw = function_args.get("arguments")
+        if not isinstance(raw, str):
+            return
+        length = len(raw)
+        length_bucket = (
+            "0" if length == 0 else
+            "1-32" if length <= 32 else
+            "33-256" if length <= 256 else
+            "257-1024" if length <= 1024 else
+            "1025+"
+        )
+        requested_name = function_args.get("name")
+        underlying_name = requested_name if isinstance(requested_name, str) and requested_name in scoped_names else ""
+        invoke_hook(
+            "tool_bridge_error",
+            bridge_tool="tool_call",
+            underlying_tool_name=underlying_name,
+            nested_arg_type="string",
+            nested_arg_length_bucket=length_bucket,
+            parser_class="nested_json_invalid",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+            dispatched=False,
+        )
+    except Exception as hook_error:
+        logger.debug("tool_bridge_error observer failed: %s", hook_error)
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1110,8 +1149,24 @@ def handle_function_call(
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return json.dumps({"error": err or "tool_call could not be resolved"},
-                                  ensure_ascii=False)
+                result = {"error": err or "tool_call could not be resolved"}
+                if err and err.startswith("tool_call 'arguments' is not valid JSON"):
+                    _emit_tool_bridge_json_error_hook(
+                        function_args or {},
+                        _ts_mod.scoped_deferrable_names(current_defs),
+                        turn_id,
+                        api_request_id,
+                    )
+                    result.update({
+                        "code": "tool_bridge_arguments_invalid_json",
+                        "dispatched": False,
+                        "next_step": (
+                            "Pass arguments as a JSON object matching the tool_describe "
+                            "schema; do not wrap the object in a JSON string. "
+                            "The rejected call did not execute any tool."
+                        ),
+                    })
+                return json.dumps(result, ensure_ascii=False)
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
