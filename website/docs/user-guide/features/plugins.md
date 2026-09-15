@@ -193,6 +193,7 @@ Plugins can register callbacks for these lifecycle events. See the **[Event Hook
 |------|-----------|
 | [`pre_tool_call`](/user-guide/features/hooks#pre_tool_call) | Before any tool executes |
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns |
+| [`tool_bridge_error`](/user-guide/features/hooks#tool_bridge_error) | Deferred `tool_call` rejects invalid nested JSON before the underlying tool runs; shape metadata only |
 | [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the LLM loop — can return `{"context": "..."}` to [inject context into the user message](/user-guide/features/hooks#pre_llm_call) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the LLM loop (successful turns only) |
 | [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) |
