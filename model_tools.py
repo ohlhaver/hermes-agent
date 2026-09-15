@@ -1058,7 +1058,7 @@ def _emit_tool_bridge_json_error_hook(
             dispatched=False,
         )
     except Exception as hook_error:
-        logger.debug("tool_bridge_error observer failed: %s", hook_error)
+        logger.debug("tool_bridge_error observer failed: %s", type(hook_error).__name__)
 
 
 def handle_function_call(
