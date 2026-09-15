@@ -135,6 +135,9 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
+    # A bridge can reject nested arguments before the underlying tool and its
+    # pre/post hooks run. Observers receive shape metadata, never arguments.
+    "tool_bridge_error",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
