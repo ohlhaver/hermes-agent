@@ -364,6 +364,64 @@ class TestHandleFunctionCallIntegration:
         # dispatch path completed without error.
         assert "matches" in parsed or "error" in parsed
 
+    def test_invalid_nested_json_reports_shape_and_never_dispatches(self):
+        """A bridge parse failure stays observable without exposing arguments."""
+        import model_tools
+        from hermes_cli.plugins import get_plugin_manager
+        from tools.registry import registry
+
+        calls = []
+        observations = []
+        name = "mcp_hpd705_fixture_read"
+        toolset = "mcp-hpd705-fixture"
+
+        def handler(args, **_kwargs):
+            calls.append(args)
+            return json.dumps({"ok": True})
+
+        registry.register(
+            name=name,
+            handler=handler,
+            schema=_td(name, "Synthetic read", {"query": {"type": "string"}}),
+            toolset=toolset,
+        )
+        manager = get_plugin_manager()
+        listeners = manager._hooks.setdefault("tool_bridge_error", [])
+        listeners.append(lambda **kwargs: observations.append(kwargs))
+        try:
+            bad = "PRIVATE_SENTINEL {invalid"
+            result = json.loads(model_tools.handle_function_call(
+                function_name="tool_call",
+                function_args={"name": name, "arguments": bad},
+                enabled_toolsets=[toolset],
+                turn_id="opaque-turn",
+                api_request_id="turn:api:3",
+            ))
+            assert result["code"] == "tool_bridge_arguments_invalid_json"
+            assert result["dispatched"] is False
+            assert "JSON object" in result["next_step"]
+            assert calls == []
+            assert len(observations) == 1
+            event = observations[0]
+            assert event["underlying_tool_name"] == name
+            assert event["nested_arg_type"] == "string"
+            assert event["parser_class"] == "nested_json_invalid"
+            assert event["turn_id"] == "opaque-turn"
+            assert event["api_request_id"] == "turn:api:3"
+            assert event["dispatched"] is False
+            assert bad not in repr(event)
+
+            good = json.loads(model_tools.handle_function_call(
+                function_name="tool_call",
+                function_args={"name": name, "arguments": {"query": "public"}},
+                enabled_toolsets=[toolset],
+            ))
+            assert good["ok"] is True
+            assert calls == [{"query": "public"}]
+            assert len(observations) == 1
+        finally:
+            listeners.pop()
+
 
 class TestRegression_OpenClawCron84141:
     """Regression guard for the OpenClaw cron-tool-loss class of bug.
@@ -535,4 +593,3 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
