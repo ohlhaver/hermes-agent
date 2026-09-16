@@ -454,9 +454,15 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
     }
+    built_children = []
+
+    def build_child(**kwargs):
+        built_children.append(kwargs)
+        return fake_child
+
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
-    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     out = dt.delegate_task(
@@ -469,6 +475,8 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert parsed["status"] == "dispatched"
     assert parsed["mode"] == "background"
     assert parsed["delegation_id"].startswith("deleg_")
+    assert len(built_children) == 1
+    assert built_children[0]["delegation_id"] == parsed["delegation_id"]
     # Non-blocking invariant: delegate_task returned while the child is STILL
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
@@ -871,5 +879,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

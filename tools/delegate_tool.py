@@ -1086,6 +1086,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Stable id for an async delegation batch. Lifecycle consumers use this
+    # during subagent_start so they can persist child-to-result bindings before
+    # the child has any opportunity to finish.
+    delegation_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1463,6 +1467,7 @@ def _build_child_agent(
             child_subagent_id=subagent_id,
             child_role=effective_role,
             child_goal=goal,
+            delegation_id=delegation_id,
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
@@ -2607,6 +2612,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                delegation_id=live_deleg_id if background else None,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
