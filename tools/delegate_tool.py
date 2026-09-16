@@ -2568,12 +2568,17 @@ def delegate_task(
     # live_paths is empty and delegation proceeds exactly as before.
     from tools.delegation_live_log import (
         create_live_transcripts,
+        new_live_delegation_id,
         update_manifest_statuses,
         wrap_progress_callback,
     )
 
+    # The async delivery identity is a correctness boundary, not a logging
+    # detail. Allocate it before the best-effort transcript side channel so an
+    # unwritable cache cannot make subagent_start race the eventual dispatch.
+    async_delegation_id = new_live_delegation_id() if background else None
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
+        task_list, context, delegation_id=async_delegation_id
     )
 
     # Save parent tool names BEFORE any child construction mutates the global.
@@ -2612,7 +2617,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
-                delegation_id=live_deleg_id if background else None,
+                delegation_id=async_delegation_id,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3022,7 +3027,7 @@ def delegate_task(
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
+            delegation_id=async_delegation_id,
         )
 
         if dispatch.get("status") == "dispatched":
