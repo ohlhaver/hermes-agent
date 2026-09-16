@@ -61,6 +61,42 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+class TestDelegationLifecycleHook(unittest.TestCase):
+    """Lifecycle consumers can bind a child before it starts running."""
+
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 50})
+    @patch("run_agent.AIAgent")
+    @patch("hermes_cli.plugins.invoke_hook")
+    def test_subagent_start_includes_background_delegation_id(
+        self, mock_invoke_hook, MockAgent, _mock_cfg
+    ):
+        child = MagicMock()
+        child.session_id = "child-session-1"
+        MockAgent.return_value = child
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session-1"
+
+        _build_child_agent(
+            task_index=0,
+            goal="Research flights",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=50,
+            task_count=1,
+            parent_agent=parent,
+            delegation_id="deleg-background-1",
+        )
+
+        mock_invoke_hook.assert_called_once()
+        hook_name, = mock_invoke_hook.call_args.args
+        self.assertEqual(hook_name, "subagent_start")
+        self.assertEqual(
+            mock_invoke_hook.call_args.kwargs["delegation_id"],
+            "deleg-background-1",
+        )
+
+
 class TestDelegateRequirements(unittest.TestCase):
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
