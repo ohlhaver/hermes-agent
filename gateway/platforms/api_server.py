@@ -877,7 +877,6 @@ try:
         remove_job as _cron_remove,
         pause_job as _cron_pause,
         resume_job as _cron_resume,
-        trigger_job as _cron_trigger,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -888,7 +887,6 @@ except ImportError:
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
-    _cron_trigger = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -4356,10 +4354,27 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = _cron_trigger(job_id)
+            job = _cron_get(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                return web.json_response({"error": "Job is paused/disabled; resume it before running."}, status=409)
+            from cron.executions import latest_executions
+            latest = latest_executions([job_id]).get(job_id) or {}
+            if latest.get("status") in {"claimed", "running"}:
+                return web.json_response({"error": "Job is already running; not run again."}, status=409)
+
+            from tools.cronjob_tools import _execute_job_now
+            with _reserve_pending_api_work(self) as reservation:
+                # Use the manual path's atomic claim and execution ledger. The
+                # claim rechecks pause/disabled state after this admission read.
+                # Unlike trigger_job, this never implicitly resumes the job.
+                task = asyncio.create_task(asyncio.to_thread(_execute_job_now, job))
+                reservation["detached"] = True
+                task.add_done_callback(lambda _task: _release_pending_api_work(self, reservation))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                return web.json_response({"status": "accepted", "job": job}, status=202)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

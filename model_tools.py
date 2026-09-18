@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Collection, Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -971,6 +971,66 @@ def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optio
     return "ok", None, None
 
 
+def _complete_plugin_approval_receipt(
+    function_name: str,
+    result: Any,
+    tool_call_id: Optional[str],
+    status: Optional[str],
+) -> None:
+    """Close a plugin-approved native card from the common post-tool seam."""
+    try:
+        from tools.approval import (
+            complete_gateway_tool_execution,
+            has_gateway_tool_execution,
+        )
+
+        if not has_gateway_tool_execution(tool_call_id or ""):
+            return
+    except Exception:
+        return
+
+    try:
+        parsed_result = json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        parsed_result = None
+    receipt_status = str(status or "").strip().lower()
+    receipt_exit_code = None
+    receipt_failed = receipt_status in {
+        "error", "failed", "timeout", "interrupted", "cancelled", "blocked",
+    }
+    if isinstance(parsed_result, dict):
+        raw_exit_code = parsed_result.get("exit_code")
+        if isinstance(raw_exit_code, int) and not isinstance(raw_exit_code, bool):
+            receipt_exit_code = raw_exit_code
+        parsed_status = str(parsed_result.get("status") or "").strip().lower()
+        receipt_failed = receipt_failed or (
+            bool(parsed_result.get("error"))
+            or parsed_status in {
+                "error", "failed", "timeout", "interrupted", "cancelled",
+                "blocked", "disabled", "pending_approval", "approval_required",
+            }
+            or parsed_result.get("success") is False
+            or (receipt_exit_code is not None and receipt_exit_code != 0)
+        )
+    try:
+        from agent.display import _detect_tool_failure
+
+        canonical_failure, _ = _detect_tool_failure(function_name, result)
+        receipt_failed = receipt_failed or canonical_failure
+    except Exception:
+        # The explicit structured checks above remain the fail-safe baseline;
+        # display helpers are intentionally not required for receipt delivery.
+        pass
+    try:
+        complete_gateway_tool_execution(
+            tool_call_id or "",
+            outcome="failed" if receipt_failed else "executed",
+            exit_code=receipt_exit_code,
+        )
+    except Exception as receipt_err:
+        logger.warning("Failed to publish plugin-approved tool outcome: %s", receipt_err)
+
+
 def _emit_post_tool_call_hook(
     *,
     function_name: str,
@@ -996,6 +1056,18 @@ def _emit_post_tool_call_hook(
     result *after* the gate (parsing the result is only worth it when a
     listener will actually consume it).
     """
+    # This is also the common completion seam for plugin-approved side
+    # effects.  It must run even when no observer plugin registered a
+    # post_tool_call hook; the native approval card is part of the execution
+    # contract, not optional observability. The helper returns after one locked
+    # dict lookup for ordinary tool calls that own no native approval.
+    _complete_plugin_approval_receipt(
+        function_name,
+        result,
+        tool_call_id,
+        status,
+    )
+
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
@@ -1020,6 +1092,45 @@ def _emit_post_tool_call_hook(
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
+
+
+def _emit_tool_bridge_json_error_hook(
+    function_args: Dict[str, Any],
+    scoped_names: Collection[str],
+    turn_id: Optional[str],
+    api_request_id: Optional[str],
+) -> None:
+    """Report a rejected nested JSON string without exposing its contents."""
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        if not has_hook("tool_bridge_error"):
+            return
+        raw = function_args.get("arguments")
+        if not isinstance(raw, str):
+            return
+        length = len(raw)
+        length_bucket = (
+            "0" if length == 0 else
+            "1-32" if length <= 32 else
+            "33-256" if length <= 256 else
+            "257-1024" if length <= 1024 else
+            "1025+"
+        )
+        requested_name = function_args.get("name")
+        underlying_name = requested_name if isinstance(requested_name, str) and requested_name in scoped_names else ""
+        invoke_hook(
+            "tool_bridge_error",
+            bridge_tool="tool_call",
+            underlying_tool_name=underlying_name,
+            nested_arg_type="string",
+            nested_arg_length_bucket=length_bucket,
+            parser_class="nested_json_invalid",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+            dispatched=False,
+        )
+    except Exception as hook_error:
+        logger.debug("tool_bridge_error observer failed: %s", type(hook_error).__name__)
 
 
 def handle_function_call(
@@ -1110,8 +1221,24 @@ def handle_function_call(
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return json.dumps({"error": err or "tool_call could not be resolved"},
-                                  ensure_ascii=False)
+                result = {"error": err or "tool_call could not be resolved"}
+                if err and err.startswith("tool_call 'arguments' is not valid JSON"):
+                    _emit_tool_bridge_json_error_hook(
+                        function_args or {},
+                        _ts_mod.scoped_deferrable_names(current_defs),
+                        turn_id,
+                        api_request_id,
+                    )
+                    result.update({
+                        "code": "tool_bridge_arguments_invalid_json",
+                        "dispatched": False,
+                        "next_step": (
+                            "Pass arguments as a JSON object matching the tool_describe "
+                            "schema; do not wrap the object in a JSON string. "
+                            "The rejected call did not execute any tool."
+                        ),
+                    })
+                return json.dumps(result, ensure_ascii=False)
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
@@ -1221,11 +1348,43 @@ def handle_function_call(
 
             edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=edit_block_message,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="blocked",
+                    error_type="edit_approval",
+                    error_message=edit_block_message,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
                 return edit_block_message
         except Exception as _edit_approval_err:
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
+                result = json.dumps(
+                    {"error": "Edit approval denied: approval guard failed"},
+                    ensure_ascii=False,
+                )
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    status="error",
+                    error_type="edit_approval_error",
+                    error_message=str(_edit_approval_err),
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
@@ -1349,7 +1508,22 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        result = json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        _emit_post_tool_call_hook(
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            status="error",
+            error_type=type(e).__name__,
+            error_message=_sanitize_tool_error(error_msg),
+            middleware_trace=list(_tool_middleware_trace),
+        )
+        return result
 
 
 # =============================================================================

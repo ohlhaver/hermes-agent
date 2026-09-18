@@ -2045,6 +2045,25 @@ class TestMediaFallbackDoesNotLeakHostPath:
     SENSITIVE_PATH = "/home/jayne/.hermes/cache/media/sensitive_host_path_abc123.bin"
 
     @pytest.mark.asyncio
+    async def test_commentary_defaults_to_regular_send(self):
+        adapter = _CapturingAdapter()
+
+        result = await adapter.send_commentary(
+            chat_id="123",
+            content="I'll inspect that first.",
+            reply_to="source-message",
+            metadata={"run_id": "run-1"},
+        )
+
+        assert result.success
+        assert adapter.sent == [{
+            "chat_id": "123",
+            "content": "I'll inspect that first.",
+            "reply_to": "source-message",
+            "metadata": {"run_id": "run-1"},
+        }]
+
+    @pytest.mark.asyncio
     async def test_send_voice_fallback_omits_audio_path(self):
         adapter = _CapturingAdapter()
         result = await adapter.send_voice(chat_id="123", audio_path=self.SENSITIVE_PATH)

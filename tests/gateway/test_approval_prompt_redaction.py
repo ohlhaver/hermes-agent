@@ -17,7 +17,14 @@ the redactor regexes so the assertions stay meaningful, but contain no real
 or real-looking key, so secret scanners do not flag this file.
 """
 
-from gateway.run import _redact_approval_command
+import pytest
+
+from gateway.platforms.base import SendResult
+from gateway.run import (
+    _NativeApprovalContractError,
+    _native_approval_execution_binding,
+    _redact_approval_command,
+)
 
 # Synthetic, scanner-safe credential fixtures. Each matches its redactor
 # regex (ghp_/sk-/JWT) but is unmistakably fake -- a run of X's, never a
@@ -151,6 +158,67 @@ class TestApprovalCommandWiring:
             assert isinstance(value.func, ast.Attribute) and value.func.attr == "get"
             assert isinstance(value.args[0], ast.Constant) and value.args[0].value == name
             assert isinstance(value.args[1], ast.Constant) and value.args[1].value is default
+
+
+class TestNativeApprovalExecutionContract:
+    def test_extracts_complete_exact_binding(self):
+        binding = {
+            "key": "native-request",
+            "payloadHash": "4" * 64,
+            "idempotencyKey": "native-request",
+        }
+        result = SendResult(
+            success=True,
+            message_id="message-1",
+            raw_response={"approvalRequest": {"execution": dict(binding)}},
+        )
+        assert _native_approval_execution_binding(result) == binding
+
+    @pytest.mark.parametrize(
+        "raw_response",
+        [
+            None,
+            {},
+            {"approvalRequest": {}},
+            {"approvalRequest": {"execution": {"key": "only-one-field"}}},
+        ],
+    )
+    def test_missing_or_invalid_binding_fails_closed(self, raw_response):
+        result = SendResult(
+            success=True,
+            message_id="message-1",
+            raw_response=raw_response,
+        )
+        with pytest.raises(_NativeApprovalContractError):
+            _native_approval_execution_binding(result)
+
+    def test_native_binding_failure_cancels_and_never_reaches_text_fallback(self):
+        """Production closure must close an orphan card and re-raise.
+
+        The closure captures live gateway state and cannot be called in
+        isolation, so this structural regression test binds the two critical
+        branches: invalid successful delivery calls the optional cancel hook,
+        and every exact-outcome exception raises before the legacy text path.
+        """
+        import ast
+        import inspect
+        import gateway.run as run
+
+        source = inspect.getsource(run)
+        tree = ast.parse(source)
+        notify = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_approval_notify_sync"
+        )
+        segment = ast.get_source_segment(source, notify) or ""
+        assert '_cancel_native_wait("invalid_execution_binding")' in segment
+        exact_fail_closed = [
+            node for node in ast.walk(notify)
+            if isinstance(node, ast.If)
+            and "_has_exact_outcome" in (ast.get_source_segment(source, node.test) or "")
+            and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+        ]
+        assert exact_fail_closed, "exact native failures must re-raise before text fallback"
 
 
 class TestApprovalTextFallbackContract:

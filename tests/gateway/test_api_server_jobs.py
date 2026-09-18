@@ -11,6 +11,8 @@ Covers:
 """
 
 import logging
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -540,22 +542,78 @@ class TestResumeJob:
 
 class TestRunJob:
     @pytest.mark.asyncio
-    async def test_run_job(self, adapter):
-        """POST /api/jobs/{id}/run returns triggered job."""
-        app = _create_app(adapter)
-        triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
-        mock_trigger = MagicMock(return_value=triggered_job)
-        async with TestClient(TestServer(app)) as cli:
-            with patch(
-                f"{_MOD}._CRON_AVAILABLE", True
-            ), patch(
-                f"{_MOD}._cron_trigger", mock_trigger
-            ):
-                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
-                assert resp.status == 200
-                data = await resp.json()
-                assert data["job"] == triggered_job
-                mock_trigger.assert_called_once_with(VALID_JOB_ID)
+    async def test_run_job_uses_manual_claim_in_background_and_tracks_drain(self, adapter, tmp_path, monkeypatch):
+        from cron.jobs import create_job, get_job, mark_job_run
+        from cron.executions import latest_executions, finish_execution
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        job = create_job(prompt="x", schedule="0 8,17 * * *", name="manual")
+        started, release = threading.Event(), threading.Event()
+
+        def execute(claimed_job):
+            started.set()
+            assert release.wait(5)
+            finish_execution(claimed_job["execution_id"], success=True)
+            mark_job_run(claimed_job["id"], True)
+            return True
+
+        with patch("cron.scheduler.run_one_job", side_effect=execute) as run:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                try:
+                    response = await cli.post(f"/api/jobs/{job['id']}/run")
+                    assert response.status == 202
+                    assert (await response.json())["job"] == job
+                    assert await asyncio.to_thread(started.wait, 5)
+                    assert adapter.active_agent_work_count() > 0
+                    assert not release.is_set()  # response did not wait for execution
+                    duplicate = await cli.post(f"/api/jobs/{job['id']}/run")
+                    assert duplicate.status == 409
+                    assert run.call_count == 1
+                    current = get_job(job["id"])
+                    for key in ("prompt", "schedule", "enabled", "state", "model", "provider"):
+                        assert current[key] == job[key]
+                finally:
+                    release.set()
+                    await asyncio.gather(*tuple(adapter._background_tasks))
+                    await asyncio.sleep(0)
+        assert adapter.active_agent_work_count() == 0
+        assert latest_executions([job["id"]])[job["id"]]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("availability", [{"enabled": False}, {"state": "paused"}])
+    async def test_run_job_refuses_unavailable_without_mutation(self, adapter, tmp_path, monkeypatch, availability):
+        from cron.jobs import create_job, get_job, update_job
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        job = create_job(prompt="x", schedule="every 5m", name="manual")
+        update_job(job["id"], availability)
+        before = get_job(job["id"])
+        with patch("tools.cronjob_tools._execute_job_now") as execute:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                response = await cli.post(f"/api/jobs/{job['id']}/run")
+                assert response.status == 409
+        execute.assert_not_called()
+        assert get_job(job["id"]) == before
+
+    @pytest.mark.asyncio
+    async def test_pause_after_admission_is_rechecked_by_native_claim(self, adapter, tmp_path, monkeypatch):
+        from cron.jobs import create_job, get_job, pause_job
+        from cron.executions import latest_executions
+        from tools.cronjob_tools import _execute_job_now
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        job = create_job(prompt="x", schedule="every 5m", name="manual")
+
+        def pause_then_claim(snapshot):
+            pause_job(snapshot["id"])
+            return _execute_job_now(snapshot)
+
+        with patch("tools.cronjob_tools._execute_job_now", side_effect=pause_then_claim), patch("cron.scheduler.run_one_job") as run:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                response = await cli.post(f"/api/jobs/{job['id']}/run")
+                assert response.status == 202
+                await asyncio.gather(*tuple(adapter._background_tasks))
+        run.assert_not_called()
+        assert get_job(job["id"])["state"] == "paused"
+        assert get_job(job["id"])["next_run_at"] == job["next_run_at"]
+        assert latest_executions([job["id"]]) == {}
 
     @pytest.mark.asyncio
     async def test_run_job_refuses_during_gateway_drain(self, adapter):

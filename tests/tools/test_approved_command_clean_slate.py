@@ -86,6 +86,80 @@ def test_non_approved_command_still_interrupts_on_stale_bit(monkeypatch):
     assert "[Command interrupted]" in result["output"]
 
 
+def test_approved_command_reports_real_terminal_outcome_once(monkeypatch):
+    from tools import approval as approval_mod
+
+    session_key = "approved-outcome-session"
+    binding = {
+        "key": "runtime-approved-command",
+        "payloadHash": "b" * 64,
+        "idempotencyKey": "runtime-approved-command",
+    }
+    received = []
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {
+        "approved": True,
+        "user_approved": True,
+        "description": "test action",
+        "execution": binding,
+    })
+    approval_mod.register_gateway_execution_notify(session_key, received.append)
+    try:
+        result = json.loads(tt.terminal_tool(command="true", task_id=session_key))
+    finally:
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert result["exit_code"] == 0
+    assert received == [{
+        "execution": binding,
+        "outcome": "executed",
+        "exitCode": 0,
+    }]
+
+
+def test_approved_background_command_fails_closed_without_false_success(monkeypatch):
+    from tools import approval as approval_mod
+    from tools.process_registry import process_registry
+
+    session_key = "approved-background-outcome-session"
+    binding = {
+        "key": "runtime-approved-background-command",
+        "payloadHash": "e" * 64,
+        "idempotencyKey": "runtime-approved-background-command",
+    }
+    received = []
+    spawned = []
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *a, **k: {
+        "approved": True,
+        "user_approved": True,
+        "description": "test background action",
+        "execution": binding,
+        "execution_session_key": session_key,
+    })
+    monkeypatch.setattr(
+        process_registry,
+        "spawn_local",
+        lambda **kwargs: spawned.append(kwargs),
+    )
+    approval_mod.register_gateway_execution_notify(session_key, received.append)
+    try:
+        result = json.loads(tt.terminal_tool(
+            command="sleep 1",
+            background=True,
+            task_id=session_key,
+        ))
+    finally:
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert result["status"] == "blocked"
+    assert result["exit_code"] == -1
+    assert spawned == []
+    assert received == [{
+        "execution": binding,
+        "outcome": "failed",
+        "exitCode": -1,
+    }]
+
+
 def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
     """The clean-slate clear must NOT make approved commands un-interruptible:
     an interrupt that arrives after execution starts still SIGINTs (130)."""
