@@ -1052,6 +1052,14 @@ def _copy_fallback_warning(target: Dict[str, Any], result: Dict[str, Any]) -> Di
         target["fallback_warning"] = result["fallback_warning"]
         target["browser_engine"] = result.get("browser_engine")
         target["browser_engine_fallback"] = result.get("browser_engine_fallback")
+    # Tool formatters project CLI fields; preserve only the trusted native
+    # session's private handoff metadata, never a website/provider-supplied URL.
+    binding = _isolated_browser_binding() if "takeover_href" in result else None
+    if binding:
+        from tools.isolated_browser import valid_takeover_href
+        if valid_takeover_href(binding[1], result.get("takeover_href")) and type(result.get("needs_user_takeover")) is bool:
+            target["takeover_href"] = result["takeover_href"]
+            target["needs_user_takeover"] = result["needs_user_takeover"]
     return target
 
 

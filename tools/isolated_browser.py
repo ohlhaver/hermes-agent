@@ -27,6 +27,12 @@ from typing import Callable
 MAX_MESSAGE = 2 * 1024 * 1024
 
 
+def valid_takeover_href(session_id, href):
+    return (isinstance(session_id, str) and
+            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", session_id) is not None and
+            href == f"/api/workspace/preview/4321/browser/{session_id}")
+
+
 class BrowserBoundaryError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
@@ -42,11 +48,14 @@ class IsolatedBrowserBoundary:
 
     def __init__(self, lease, execute: Callable, safe_return: Callable, *,
                  agent_uid: int, management_uid: int, session_id: str,
-                 expires_at: float, now: Callable = time.time):
+                 expires_at: float, now: Callable = time.time, takeover_href=None):
         if agent_uid == management_uid or agent_uid == os.geteuid():
             raise BrowserBoundaryError("distinct_agent_uid_required")
         if not session_id or not (now() < expires_at <= now() + 1800):
             raise BrowserBoundaryError("invalid_session")
+        if takeover_href is not None and not valid_takeover_href(session_id, takeover_href):
+            raise BrowserBoundaryError("invalid_takeover_href")
+        self.takeover_href = takeover_href
         self.lease = lease
         self.execute = execute
         self.safe_return = safe_return
@@ -61,6 +70,22 @@ class IsolatedBrowserBoundary:
         self.ready_viewer = None
         self.viewer_id = None
         self.transition = False
+
+    def handoff_metadata(self, uid, request, response):
+        with self.condition:
+            if (not self.takeover_href or uid != self.agent_uid or not isinstance(request, dict) or
+                    request.get("method") != "browser.command" or request.get("session_id") != self.session_id or
+                    self.revoked or self.now() >= self.expires_at):
+                return
+            paused = response.get("code") in {"human_has_control", "handoff_pending"}
+            if response.get("ok") is True and isinstance(response.get("result"), dict):
+                target = response["result"]
+                paused = target.get("success") is False
+            elif paused:
+                target = response
+            else:
+                return
+            target.update(takeover_href=self.takeover_href, needs_user_takeover=paused)
 
     def _bound(self, request):
         if not isinstance(request, dict) or request.get("session_id") != self.session_id:
@@ -243,6 +268,7 @@ class BrowserRpcHandler(socketserver.StreamRequestHandler):
 
     def handle(self):
         self.connection.settimeout(40)
+        uid, request = None, None
         try:
             raw_uid = self.connection.getsockopt(socket.SOL_SOCKET, self.server.peer_credential_option, 12)
             _, uid, _ = struct.unpack("3i", raw_uid)
@@ -260,6 +286,7 @@ class BrowserRpcHandler(socketserver.StreamRequestHandler):
         except Exception:
             # No raw website/native/JSON exception or stack trace on this wire.
             response = {"ok": False, "code": "browser_unavailable"}
+        self.server.boundary.handoff_metadata(uid, request, response)
         encoded = json.dumps(response, separators=(",", ":")).encode() + b"\n"
         if len(encoded) > MAX_MESSAGE:
             encoded = b'{"ok":false,"code":"response_too_large"}\n'
@@ -292,8 +319,13 @@ def command_from_agent(socket_path: str, session_id: str, command: str, args: li
             code = response.get("code")
             if code not in {"human_has_control", "session_expired", "command_denied", "handoff_pending"}:
                 code = "browser_unavailable"
-            return {"success": False, "code": code,
-                    "error": "Browser is paused or unavailable. Ask the user to take over or return control."}
+            result = {"success": False, "code": code,
+                      "error": "Browser is paused or unavailable. Ask the user to take over or return control."}
+            href = response.get("takeover_href")
+            if valid_takeover_href(session_id, href) and response.get("needs_user_takeover") is True:
+                result.update(takeover_href=href, needs_user_takeover=True)
+                result["error"] += f" [Open private browser]({href})."
+            return result
     except Exception:
         return {"success": False, "code": "browser_unavailable",
                 "error": "Protected browser connection is unavailable."}
