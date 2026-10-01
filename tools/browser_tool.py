@@ -144,9 +144,30 @@ from tools.tool_backend_helpers import normalize_browser_cloud_provider
 # When CAMOFOX_URL is set, all browser operations route through the
 # camofox REST API instead of the agent-browser CLI.
 try:
-    from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
+    from tools.browser_camofox import is_camofox_mode as _configured_camofox_mode
 except ImportError:
-    _is_camofox_mode = lambda: False  # noqa: E731
+    _configured_camofox_mode = lambda: False  # noqa: E731
+
+
+def _isolated_browser_binding():
+    """Product-provisioned Unix endpoint; malformed bindings fail closed.
+
+    The OS/container boundary owns profile isolation. No model tool or system
+    prompt changes; all existing browser tools use this same dispatch point.
+    """
+    from hermes_cli.config import read_raw_config
+    cfg = read_raw_config().get("browser", {})
+    if not isinstance(cfg, dict):
+        return None
+    path = cfg.get("isolated_socket", "")
+    session = cfg.get("isolated_session_id", "")
+    if not path and not session:
+        return None
+    return (path if isinstance(path, str) else "", session if isinstance(session, str) else "")
+
+
+def _is_camofox_mode():
+    return _isolated_browser_binding() is None and _configured_camofox_mode()
 
 logger = logging.getLogger(__name__)
 
@@ -468,6 +489,8 @@ def _get_cdp_override() -> str:
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
     """
+    if _isolated_browser_binding() is not None:
+        return ""
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
         return _resolve_cdp_override(env_override)
@@ -607,7 +630,7 @@ _PROVIDER_REGISTRY: Dict[str, type] = {
 _DEFAULT_PROVIDER_REGISTRY: Dict[str, type] = dict(_PROVIDER_REGISTRY)
 
 _cached_cloud_provider: Optional[CloudBrowserProvider] = None
-_cloud_provider_resolved = False
+_cloud_provider_resolved: bool = False
 _allow_private_urls_resolved = False
 _cached_allow_private_urls: Optional[bool] = None
 _cached_agent_browser: Optional[str] = None
@@ -679,6 +702,8 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     on this module still drive the function — see
     ``_is_legacy_provider_registry_overridden``.
     """
+    if _isolated_browser_binding() is not None:
+        return None
     global _cached_cloud_provider, _cloud_provider_resolved
     if _cloud_provider_resolved:
         return _cached_cloud_provider
@@ -2058,6 +2083,18 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     Returns:
         Dict with session_name (always), bb_session_id + cdp_url (cloud only)
     """
+    binding = _isolated_browser_binding()
+    if binding is not None:
+        # The broker owns the real persistent session and its lifetime. Never
+        # create a local/cloud browser, cleanup thread or CDP supervisor here.
+        return {"session_name": "isolated", "session_key": task_id or "default",
+                "features": {"local": True, "isolated": True}, "_first_nav": False}
+    with _cleanup_lock:
+        existing = _active_sessions.get(task_id or "default", {})
+        if existing.get("externally_managed"):
+            # Its visible browser can be under human control for several
+            # minutes. Only its owning service expires/stops that browser.
+            return existing
     if task_id is None:
         task_id = "default"
 
@@ -2320,6 +2357,10 @@ def _run_browser_command(
     Returns:
         Parsed JSON response from agent-browser
     """
+    binding = _isolated_browser_binding()
+    if binding is not None:
+        from tools.isolated_browser import command_from_agent
+        return command_from_agent(*binding, command, args or [])
     if timeout is None:
         timeout = _safe_command_timeout()
     args = args or []
@@ -3678,6 +3719,8 @@ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
 
 def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
+    if _isolated_browser_binding() is not None:
+        return json.dumps(_run_browser_command(task_id or "default", "eval", [expression]), ensure_ascii=False)
     effective_task_id = _last_session_key(task_id or "default")
 
     if _eval_ssrf_guard_active(effective_task_id):
