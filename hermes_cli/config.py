@@ -1300,7 +1300,15 @@ DEFAULT_CONFIG = {
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
     },
 
+    "bot_desktop": {
+        "auto_start": False,
+        "min_free_memory_mb": 1536,
+        "idle_stop_minutes": 10,
+        "geometry": "1440x900",
+    },
     "browser": {
+        "isolated_socket": "",  # Product-provisioned Unix RPC; no local/cloud fallback when configured
+        "isolated_session_id": "",  # Non-secret run binding checked by the protected browser service
         "inactivity_timeout": 120,
         "command_timeout": 30,  # Timeout for browser commands in seconds (screenshot, navigate, etc.)
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
