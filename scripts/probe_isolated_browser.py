@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--broker-uid", type=int, default=10001)
     parser.add_argument("--agent-uid", type=int, default=10000)
     parser.add_argument("--port", type=int, default=18432)
+    parser.add_argument("--clipboard-only", action="store_true")
     args = parser.parse_args()
     if "hpd321" not in args.agent or "hpd321" not in args.browser or "hermes-browse-" not in args.context:
         raise SystemExit("Dedicated owned HPD321 test containers/context required")
@@ -57,7 +58,7 @@ with socket.socket(socket.AF_UNIX) as s:
             raise RuntimeError("management_action_failed")
         return result["result"]
 
-    def fixture(expression):
+    def fixture(expression, clipboard=False):
         return docker_python(args.browser, f"{args.broker_uid}:{args.broker_uid}", f"""
 from pathlib import Path
 import urllib.request,json,time
@@ -68,7 +69,10 @@ page=next(p for p in pages if p.get('type')=='page' and p.get('url','').startswi
 with connect(page['webSocketDebuggerUrl'],open_timeout=3) as ws:
  ws.send(json.dumps({{'id':1,'method':'Page.bringToFront'}}))
  while json.loads(ws.recv(timeout=3)).get('id')!=1: pass
- ws.send(json.dumps({{'id':2,'method':'Runtime.evaluate','params':{{'expression':{expression!r},'returnByValue':True}}}}))
+ if {clipboard!r}:
+  ws.send(json.dumps({{'id':4,'method':'Browser.grantPermissions','params':{{'permissions':['clipboardReadWrite','clipboardSanitizedWrite']}}}}))
+  while json.loads(ws.recv(timeout=3)).get('id')!=4: pass
+ ws.send(json.dumps({{'id':2,'method':'Runtime.evaluate','params':{{'expression':{expression!r},'returnByValue':True,'awaitPromise':True}}}}))
  while True:
   r=json.loads(ws.recv(timeout=3))
   if r.get('id')==2:
@@ -105,7 +109,7 @@ print(json.dumps(not os.path.exists('/profile/hermes') and not os.path.exists('/
       };
       document.getElementById('pw').focus();return true;
     })()"""
-    checks["fixture_ready"] = fixture(setup)["value"] is True
+    checks["fixture_ready"] = fixture("document.body.innerHTML='<h1>Clipboard handback</h1>'; true" if args.clipboard_only else setup)["value"] is True
     viewer_id = "hpd321-probe-viewer"
     status = management("display.status")
     grant = management("display.lease.acquire", epoch=status["lease"]["epoch"], viewer_id=viewer_id)
@@ -136,6 +140,20 @@ print(json.dumps(not os.path.exists('/profile/hermes') and not os.path.exists('/
         assert read(4)==b"\x00\x00\x00\x00"
         send(b"\x01")
         init=read(24);read(int.from_bytes(init[20:24],"big"))
+        clipboard_marker = b"synthetic-clipboard-entry"
+        send(b"\x06\0\0\0" + len(clipboard_marker).to_bytes(4,"big") + clipboard_marker)
+        time.sleep(.2)
+        checks["human_remote_clipboard_seeded"] = fixture("navigator.clipboard.readText().then(v => v === 'synthetic-clipboard-entry')",clipboard=True)["value"] is True
+        if args.clipboard_only:
+            returned=management("display.lease.release",epoch=grant["epoch"],viewer_id=viewer_id)
+            checks["explicit_safe_handback"] = returned["holder"] == "agent"
+            checks["remote_clipboard_cleared_at_handback"] = fixture("navigator.clipboard.readText().then(v => v === '')",clipboard=True)["value"] is True
+            checks["agent_continues_after_clipboard_cleanup"] = agent()["success"] is True
+            status=management("display.status")
+            management("display.cancel",epoch=status["lease"]["epoch"])
+            print(json.dumps({"checks":checks,"all_passed":all(checks.values()),"evidence":"additional real Linux clipboard handback case; no repeated password/2FA flow"},sort_keys=True))
+            if not all(checks.values()): raise SystemExit(1)
+            return
         def key(sym):
             send(struct.pack(">BBHI",4,1,0,sym)+struct.pack(">BBHI",4,0,0,sym))
             time.sleep(.04)
@@ -152,6 +170,7 @@ print(json.dumps(not os.path.exists('/profile/hermes') and not os.path.exists('/
         checks["same_browser_login_completed"] = fixture("document.cookie.includes('hpd321fixture=complete') && !!document.getElementById('next')")["value"] is True
         returned = management("display.lease.release", epoch=grant["epoch"], viewer_id=viewer_id)
         checks["explicit_safe_handback"] = returned["holder"] == "agent"
+        checks["remote_clipboard_cleared_at_handback"] = fixture("navigator.clipboard.readText().then(v => v === '')",clipboard=True)["value"] is True
         continued=agent()
         snapshot=continued.get("data",{}).get("snapshot","")
         checks["agent_continues_same_logged_in_page"] = continued.get("success") is True and "Continue task" in snapshot

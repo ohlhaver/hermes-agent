@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import socket
+import struct
 import threading
 import time
 import urllib.request
@@ -44,6 +46,60 @@ def public_url(url):
     parsed = urlsplit(url)
     # Credential-bearing redirects/fragment/query are never ordinary metadata.
     return urlunsplit((parsed.scheme, parsed.hostname or "", parsed.path, "", ""))
+
+
+def clear_remote_clipboard(socket_path):
+    """Clear the PRIVATE native Xvnc clipboard before handing back.
+
+    A site's Paste button could otherwise reveal prior human clipboard data
+    even though arbitrary agent JS/clipboard reads are fenced. Use the native
+    RFB protocol, not a new dependency or model executor. Never return contents.
+    """
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(2)
+        client.connect(str(socket_path))
+        def read(n):
+            out = bytearray()
+            while len(out) < n:
+                chunk = client.recv(n-len(out))
+                if not chunk:
+                    raise BrowserBoundaryError("unsafe_return")
+                out.extend(chunk)
+            return bytes(out)
+        if read(12) != b"RFB 003.008\n":
+            raise BrowserBoundaryError("unsafe_return")
+        client.sendall(b"RFB 003.008\n")
+        count = read(1)[0]
+        if count == 0 or 1 not in read(count):
+            raise BrowserBoundaryError("unsafe_return")
+        client.sendall(b"\x01")
+        if read(4) != b"\x00\x00\x00\x00":
+            raise BrowserBoundaryError("unsafe_return")
+        client.sendall(b"\x01")
+        init = read(24)
+        name_length = int.from_bytes(init[20:24], "big")
+        if name_length > 4096:
+            raise BrowserBoundaryError("unsafe_return")
+        read(name_length)
+        # Empty ClientCutText, then a one-pixel update request as an ordered
+        # server round trip. Consume any server clipboard notification without
+        # exporting, printing or storing it outside this private process.
+        client.sendall(b"\x06\0\0\0\0\0\0\0" + struct.pack(">BBHHHH", 3, 0, 0, 0, 1, 1))
+        for _ in range(8):
+            kind = read(1)[0]
+            if kind == 0:
+                read(3)
+                return
+            if kind == 2:
+                continue
+            if kind == 3:
+                size = abs(int.from_bytes(read(7)[3:7], "big", signed=True))
+                if size > 256 * 1024:
+                    raise BrowserBoundaryError("unsafe_return")
+                read(size)
+                continue
+            raise BrowserBoundaryError("unsafe_return")
+        raise BrowserBoundaryError("unsafe_return")
 
 
 class NativeBrowserExecutor:
@@ -119,6 +175,7 @@ class NativeBrowserExecutor:
         # Never return input values or exception bodies over management RPC.
         try:
             with self.lock:
+                clear_remote_clipboard(runtime.rfb_socket_path())
                 deadline_all = time.monotonic() + 15
                 for page in self.pages():
                     url = page.get("url", "")

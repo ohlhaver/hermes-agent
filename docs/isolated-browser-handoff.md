@@ -52,7 +52,9 @@ claimed by the native prototype.
 The native file lease remains authority. Human acquire fences new agent
 commands immediately, discards late results and drains already admitted work
 before allowing RFB input. Explicit handback fences human input and clears
-input/textarea values through isolated CDP worlds before releasing the lease.
+input/textarea values through isolated CDP worlds and clears the native remote
+clipboard before releasing the lease. Otherwise a site's own Paste button
+could reveal residual human clipboard data after return.
 Failure retains human ownership and allows the same viewer to correct the
 page. Console/error buffers, arbitrary JS, HTML/form-value getters, recordings,
 filesystem export and DevTools shortcuts are unavailable through agent RPC.
