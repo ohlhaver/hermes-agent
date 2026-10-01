@@ -240,7 +240,7 @@ async def run(manifest):
     executor = NativeBrowserExecutor(manifest["session_id"])
     boundary = NativeSessionBoundary(lease, executor.execute, executor.safe_return,
         agent_uid=manifest["agent_uid"], management_uid=manifest["management_uid"],
-        session_id=manifest["session_id"], expires_at=manifest["expires_at"])
+        session_id=manifest["session_id"], expires_at=manifest["expires_at"], takeover_href=manifest.get("takeover_href"))
     viewer = boundary.viewer = NativeRfbViewer(boundary, runtime.rfb_socket_path())
     servers = []
     running_servers = []

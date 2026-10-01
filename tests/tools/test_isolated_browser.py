@@ -165,3 +165,56 @@ def test_service_owned_visible_session_never_starts_the_ordinary_idle_reaper(mon
     monkeypatch.setitem(bt._active_sessions, "owned-test", session)
     monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: pytest.fail("human browser must survive ordinary idle reaper"))
     assert bt._get_session_info("owned-test") is session
+
+HANDOFF_SESSION = "11111111-1111-4111-8111-111111111111"
+HANDOFF_HREF = "/api/workspace/preview/4321/browser/" + HANDOFF_SESSION
+
+
+def handoff_boundary(href=HANDOFF_HREF):
+    return IsolatedBrowserBoundary(lease, lambda command, args: {"success": True}, lambda: True,
+        agent_uid=os.geteuid() + 1, management_uid=os.geteuid(), session_id=HANDOFF_SESSION,
+        expires_at=time.time() + 300, takeover_href=href)
+
+
+def test_handoff_metadata_is_same_session_authority_not_request_input():
+    b = handoff_boundary()
+    request = {"method": "browser.command", "session_id": HANDOFF_SESSION, "takeover_href": "https://foreign.invalid"}
+    response = {"ok": True, "result": {"success": True}}
+    b.handoff_metadata(b.agent_uid, request, response)
+    assert response["result"] == {"success": True, "takeover_href": HANDOFF_HREF, "needs_user_takeover": False}
+    paused = {"ok": False, "code": "human_has_control"}
+    b.handoff_metadata(b.agent_uid, request, paused)
+    assert paused["takeover_href"] == HANDOFF_HREF and paused["needs_user_takeover"] is True
+    failed = {"ok": True, "result": {"success": False, "error": "Browser action failed"}}
+    b.handoff_metadata(b.agent_uid, request, failed)
+    assert failed["result"]["needs_user_takeover"] is True
+
+
+@pytest.mark.parametrize("href", ["https://foreign.invalid", HANDOFF_HREF + "?ticket=synthetic", HANDOFF_HREF + "#synthetic",
+    HANDOFF_HREF + "/", HANDOFF_HREF.replace(HANDOFF_SESSION, "22222222-2222-4222-8222-222222222222"), "/browser"])
+def test_invalid_or_foreign_handoff_paths_rejected(href):
+    with pytest.raises(BrowserBoundaryError, match="invalid_takeover_href"):
+        handoff_boundary(href)
+
+
+def test_handoff_metadata_never_leaks_to_foreign_uid_session_or_expired_caller():
+    b = handoff_boundary()
+    for uid, request in [(b.management_uid, {"method": "browser.command", "session_id": HANDOFF_SESSION}),
+                         (b.agent_uid, {"method": "browser.command", "session_id": "foreign"}), (None, None)]:
+        response = {"ok": False, "code": "human_has_control"}
+        b.handoff_metadata(uid, request, response)
+        assert "takeover_href" not in response
+    b.revoked = True
+    response = {"ok": False, "code": "human_has_control"}
+    b.handoff_metadata(b.agent_uid, {"method": "browser.command", "session_id": HANDOFF_SESSION}, response)
+    assert "takeover_href" not in response
+
+
+def test_actual_tool_projection_carries_only_bound_native_handoff(monkeypatch):
+    from tools import browser_tool
+    monkeypatch.setattr(browser_tool, "_isolated_browser_binding", lambda: ("/private/socket", HANDOFF_SESSION))
+    result = {"success": True, "takeover_href": HANDOFF_HREF, "needs_user_takeover": False}
+    assert browser_tool._copy_fallback_warning({}, result) == {"takeover_href": HANDOFF_HREF, "needs_user_takeover": False}
+    assert browser_tool._copy_fallback_warning({}, {**result, "takeover_href": "https://foreign.invalid"}) == {}
+    monkeypatch.setattr(browser_tool, "_isolated_browser_binding", lambda: None)
+    assert browser_tool._copy_fallback_warning({}, result) == {}
