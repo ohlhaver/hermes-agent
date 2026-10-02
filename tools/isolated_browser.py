@@ -158,6 +158,14 @@ class IsolatedBrowserBoundary:
             else:
                 if method == "display.status":
                     return self.lease.public_view(self.lease.get())
+                if method == "display.cancel":
+                    # A bound management caller ends the session, rather than
+                    # transferring control. Cancellation must remain possible
+                    # after a takeover changes the lease revision.
+                    self.revoked = True
+                    self.ready_viewer = None
+                    self.lease.acquire("revoked-session")
+                    return {"revoked": True}
                 current = self._revision(request)
                 if method == "display.lease.acquire":
                     viewer = request.get("viewer_id")
@@ -209,11 +217,6 @@ class IsolatedBrowserBoundary:
                         if (not self.revoked and self.now() < self.expires_at
                                 and self.lease.viewer_may_send_input(previous_viewer)):
                             self.ready_viewer = previous_viewer
-                if method == "display.cancel":
-                    self.revoked = True
-                    self.ready_viewer = None
-                    self.lease.acquire("revoked-session")
-                    return {"revoked": True}
                 raise BrowserBoundaryError("unknown_method")
 
         try:
