@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import struct
 import threading
 import time
 import urllib.request
+from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.server import serve
@@ -103,9 +105,15 @@ def clear_remote_clipboard(socket_path):
 
 
 class NativeBrowserExecutor:
-    def __init__(self, session_id):
+    def __init__(self, session_id, *, trusted_url_validator: Callable[[str], bool] | None = None):
+        # Only a trusted service caller can supply this check. Manifests and
+        # agent/management RPC never select or replace it. The concrete consumer
+        # resolves public targets in its existing protected egress namespace.
+        if trusted_url_validator is not None and not callable(trusted_url_validator):
+            raise BrowserBoundaryError("invalid_provisioning")
         from tools import browser_tool as bt
         self.bt = bt
+        self._trusted_url_validator = trusted_url_validator
         self.session_id = session_id
         self.lock = threading.RLock()
         self.port = None
@@ -141,15 +149,40 @@ class NativeBrowserExecutor:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/list", timeout=3) as response:
             return [p for p in json.load(response) if p.get("type") == "page"]
 
+    def _url_allowed(self, url):
+        try:
+            target = urlsplit(url)
+            if target.scheme not in {"http", "https"} or not target.hostname:
+                return False
+            if self.bt._is_always_blocked_url(url) or self.bt.check_website_access(url):
+                return False
+            if self._trusted_url_validator is None:
+                return bool(self.bt._is_safe_url(url))
+            # A service validator cannot relax literal private/metadata targets.
+            # Name resolution belongs to the protected egress; each actual
+            # connection still independently enforces its checked-address policy.
+            host = target.hostname.lower().rstrip(".")
+            if target.username is not None or target.password is not None or host == "localhost" or host.endswith(".localhost"):
+                return False
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            if address is not None:
+                if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                    address = address.ipv4_mapped
+                if not address.is_global or address.is_multicast or address.is_reserved or address.is_unspecified:
+                    return False
+            return self._trusted_url_validator(url) is True
+        except Exception:
+            # Do not export target URLs, resolver errors or private diagnostics.
+            return False
+
     def execute(self, command, args):
         from agent.redact import redact_sensitive_text
         with self.lock:
             if command == "open":
-                if len(args) != 1 or urlsplit(args[0]).scheme not in {"http", "https"}:
-                    raise BrowserBoundaryError("command_denied")
-                if self.bt._is_always_blocked_url(args[0]) or not self.bt._is_safe_url(args[0]):
-                    raise BrowserBoundaryError("command_denied")
-                if self.bt.check_website_access(args[0]):
+                if len(args) != 1 or not self._url_allowed(args[0]):
                     raise BrowserBoundaryError("command_denied")
             result = self.bt._run_browser_command(self.session_id, command, args)
             if not result.get("success"):
@@ -159,7 +192,7 @@ class NativeBrowserExecutor:
             pages = self.pages()
             for page in pages:
                 url = page.get("url", "")
-                if url != "about:blank" and (self.bt._is_always_blocked_url(url) or not self.bt._is_safe_url(url)):
+                if url != "about:blank" and not self._url_allowed(url):
                     raise BrowserBoundaryError("command_denied")
             data = result.get("data", {})
             if isinstance(data, dict) and isinstance(data.get("url"), str):
@@ -182,7 +215,7 @@ class NativeBrowserExecutor:
                     if url == "about:blank":
                         continue
                     if (time.monotonic() >= deadline_all or urlsplit(url).scheme not in {"http", "https"}
-                            or not self.bt._is_safe_url(url) or self.bt._sensitive_query_param_name(url)
+                            or not self._url_allowed(url) or self.bt._sensitive_query_param_name(url)
                             or urlsplit(url).fragment):
                         return False
                     with connect(page["webSocketDebuggerUrl"], open_timeout=3, max_size=2*1024*1024) as ws:
@@ -232,12 +265,12 @@ class NativeSessionBoundary(IsolatedBrowserBoundary):
         return super().dispatch(uid, request)
 
 
-async def run(manifest):
+async def run(manifest, *, trusted_url_validator: Callable[[str], bool] | None = None):
     required = {"session_id", "expires_at", "agent_uid", "management_uid", "agent_socket", "management_socket",
                 "agent_group", "viewer_port"}
     if not required.issubset(manifest) or not hasattr(os, "geteuid") or os.geteuid() == 0:
         raise BrowserBoundaryError("invalid_provisioning")
-    executor = NativeBrowserExecutor(manifest["session_id"])
+    executor = NativeBrowserExecutor(manifest["session_id"], trusted_url_validator=trusted_url_validator)
     boundary = NativeSessionBoundary(lease, executor.execute, executor.safe_return,
         agent_uid=manifest["agent_uid"], management_uid=manifest["management_uid"],
         session_id=manifest["session_id"], expires_at=manifest["expires_at"], takeover_href=manifest.get("takeover_href"))
