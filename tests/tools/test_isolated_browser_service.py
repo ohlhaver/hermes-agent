@@ -14,6 +14,58 @@ from tools.isolated_browser import IsolatedBrowserBoundary
 from tools.bot_desktop import lease
 
 
+def test_epoch_free_cancel_exits_service_and_closes_owned_resources(monkeypatch, tmp_path):
+    """Exercise the service loop/finally with bounded process/socket fixtures."""
+    import subprocess
+    import sys
+    from contextlib import asynccontextmanager
+
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    servers, stopped = [], []
+    class Server:
+        def __init__(self, path, boundary, **kwargs):
+            self.server_address = path
+            self.boundary = boundary
+            self.closed = False
+            self.shutdown_called = False
+            from pathlib import Path
+            Path(path).touch()
+            servers.append(self)
+        def serve_forever(self):
+            pass
+        def shutdown(self):
+            self.shutdown_called = True
+        def server_close(self):
+            self.closed = True
+    @asynccontextmanager
+    async def viewer_server(*args, **kwargs):
+        boundary = servers[1].boundary
+        boundary.dispatch(0, {"session_id": "synthetic", "method": "display.lease.acquire",
+                              "epoch": lease.get().epoch, "viewer_id": "fixture-viewer"})
+        assert boundary.dispatch(0, {"session_id": "synthetic", "method": "display.cancel"}) == {"revoked": True}
+        yield
+    executor = SimpleNamespace(process=process, execute=lambda *_: {"success": True}, safe_return=lambda: True)
+    monkeypatch.setattr(service, "NativeBrowserExecutor", lambda *_a, **_k: executor)
+    monkeypatch.setattr(service.os, "geteuid", lambda: 10002)
+    monkeypatch.setattr(service, "BrowserRpcServer", Server)
+    monkeypatch.setattr(service, "serve", viewer_server)
+    monkeypatch.setattr(service.runtime, "rfb_socket_path", lambda: tmp_path / "rfb.sock")
+    monkeypatch.setattr(service.runtime, "stop", lambda: stopped.append(True))
+    manifest = {"session_id": "synthetic", "expires_at": time.time()+300, "agent_uid": 10001,
+        "management_uid": 0, "agent_socket": str(tmp_path / "agent.sock"),
+        "management_socket": str(tmp_path / "management.sock"), "agent_group": 10001, "viewer_port": 0}
+    try:
+        asyncio.run(service.run(manifest))
+        assert process.wait(timeout=3) is not None
+        assert stopped == [True] and all(s.closed and s.shutdown_called for s in servers)
+        assert not (tmp_path / "agent.sock").exists() and not (tmp_path / "management.sock").exists()
+        assert lease.human_holds() and not servers[0].boundary.viewer_may_input("fixture-viewer")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=3)
+
+
 @pytest.fixture
 def executor_factory(monkeypatch, tmp_path):
     monkeypatch.setattr(service.runtime, "start", lambda: None)
