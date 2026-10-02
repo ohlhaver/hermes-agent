@@ -9,5 +9,7 @@ graft locales
 recursive-include plugins plugin.yaml plugin.yml
 # Gateway assets include images plus YAML catalogs such as status_phrases.yaml.
 recursive-include gateway/assets *
+# Desktop startup must also survive builds from a source distribution.
+include tools/bot_desktop/launcher.sh tools/bot_desktop/wallpaper.png
 global-exclude __pycache__
 global-exclude *.py[cod]
