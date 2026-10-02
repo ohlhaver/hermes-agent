@@ -116,6 +116,33 @@ def test_disconnect_is_not_a_handback_and_cancel_cannot_resume(boundary):
     assert lease.human_holds() and not boundary.viewer_may_input("viewer-a")
 
 
+@pytest.mark.parametrize("revision", [{}, {"epoch": 0}, {"epoch": None}])
+def test_terminal_cancel_accepts_product_envelope_after_takeover(boundary, revision):
+    call(boundary, "display.lease.acquire", viewer_id="viewer-a")
+    result = boundary.dispatch(boundary.management_uid, {
+        "session_id": "test-run", "method": "display.cancel", **revision})
+    assert result == {"revoked": True}
+    assert boundary.revoked and boundary.ready_viewer is None
+    assert lease.human_holds() and not boundary.viewer_may_input("viewer-a")
+    with pytest.raises(BrowserBoundaryError, match="session_expired"):
+        agent(boundary)
+
+
+@pytest.mark.parametrize("caller,session,error", [
+    ("agent", "test-run", "caller_denied"),
+    ("other", "test-run", "caller_denied"),
+    ("management", "another-session", "session_mismatch"),
+])
+def test_epoch_free_cancel_still_requires_bound_management_caller(boundary, caller, session, error):
+    call(boundary, "display.lease.acquire", viewer_id="viewer-a")
+    uid = {"agent": boundary.agent_uid, "management": boundary.management_uid,
+           "other": boundary.management_uid + 2}[caller]
+    with pytest.raises(BrowserBoundaryError, match=error):
+        boundary.dispatch(uid, {"session_id": session, "method": "display.cancel"})
+    assert not boundary.revoked and boundary.viewer_may_input("viewer-a")
+    assert lease.human_holds()
+
+
 def test_expiry_fences_native_lease_and_viewer(boundary):
     boundary.now = lambda: boundary.expires_at
     with pytest.raises(BrowserBoundaryError, match="session_expired"):
