@@ -150,6 +150,33 @@ def test_expiry_fences_native_lease_and_viewer(boundary):
     assert lease.human_holds() and not boundary.viewer_may_input("viewer-a")
 
 
+def test_management_extends_session_only_forward_and_within_the_bound(boundary):
+    """HPD-1119: use slides the end; it never shortens, never exceeds 30 min."""
+    before = boundary.expires_at
+    later = time.time() + 1700
+    assert call(boundary, "display.extend", expires_at=later) == {"session_id": "test-run", "expires_at": later}
+    assert boundary.expires_at == later > before
+    for invalid in (later - 1, time.time() + 1800 + 60, "soon", True, None, float("nan")):
+        with pytest.raises(BrowserBoundaryError, match="invalid_session"):
+            call(boundary, "display.extend", expires_at=invalid)
+    assert boundary.expires_at == later
+    # The run loop reads expires_at, so the extension keeps the session alive.
+    boundary.now = lambda: before + 1
+    assert agent(boundary)["success"]
+
+
+def test_extend_keeps_human_control_and_cannot_revive_an_expired_session(boundary):
+    call(boundary, "display.lease.acquire", viewer_id="viewer-a")
+    call(boundary, "display.extend", expires_at=time.time() + 1000)
+    assert lease.human_holds() and boundary.viewer_may_input("viewer-a")
+    with pytest.raises(BrowserBoundaryError, match="caller_denied"):
+        boundary.dispatch(boundary.agent_uid, {"session_id": "test-run", "method": "display.extend",
+                                               "expires_at": time.time() + 1100})
+    boundary.now = lambda: boundary.expires_at
+    with pytest.raises(BrowserBoundaryError, match="session_expired"):
+        call(boundary, "display.extend", expires_at=boundary.expires_at + 10)
+
+
 def test_wrong_session_and_os_caller_are_rejected(boundary):
     with pytest.raises(BrowserBoundaryError, match="session_mismatch"):
         boundary.dispatch(boundary.agent_uid, {"session_id": "foreign-run"})
