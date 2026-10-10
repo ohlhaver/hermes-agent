@@ -220,3 +220,22 @@ def test_preflight_compacts_in_provider_units_for_listed_model():
 
     assert run(()) == 0
     assert run((HAIKU,)) == 1
+
+
+def test_turn_start_seeds_the_compressor_so_depth_matches_the_trigger():
+    # A fresh agent (restart, resumed session) compacts before any response:
+    # the compressor must already shrink its budgets by the same seed.
+    compressor = _haiku_compressor(0.0)
+    agent = _agent(HAIKU, (HAIKU,))
+    agent.context_compressor = compressor
+    _build(agent, conversation_history=[{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}])
+    assert compressor.native_token_ratio == 1.8
+    assert compressor._native_scaled(compressor.tail_token_budget) == int(compressor.tail_token_budget / 1.8)
+
+
+def test_turn_start_does_not_seed_unlisted_models():
+    compressor = _haiku_compressor(0.0)
+    agent = _agent(HAIKU, ())
+    agent.context_compressor = compressor
+    _build(agent, conversation_history=[{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}])
+    assert compressor.native_token_ratio == 0.0

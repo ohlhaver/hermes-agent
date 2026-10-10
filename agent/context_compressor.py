@@ -1555,6 +1555,12 @@ class ContextCompressor(ContextEngine):
         """
         if rough_tokens < self.threshold_tokens:
             return False
+        # HPD-1151 note: for a model listed in current_turn_sidecar_models,
+        # rough_tokens arrives already scaled into provider units while the
+        # baselines below are chars/4, so the fit-deferral below rarely
+        # applies there. Deliberate: with a calibrated ratio the scaled
+        # estimate is the better signal, and the -1 / awaiting guard above
+        # still defers exactly one turn after a compaction.
         # Immediately after a compaction the post-compression path sets
         # ``awaiting_real_usage_after_compression`` and parks
         # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still

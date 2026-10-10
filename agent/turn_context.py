@@ -197,12 +197,23 @@ def _listed_for_native_count(agent: Any) -> bool:
 
 
 def native_token_ratio(agent: Any) -> float:
-    """Provider-count / chars-4 ratio for a listed model, else 0.0 (off)."""
+    """Provider-count / chars-4 ratio for a listed model, else 0.0 (off).
+
+    An uncalibrated compressor is seeded here, so the trigger and the
+    compressor's budgets (``_native_scaled``) always use the same value, also
+    for a compaction before the first response of a fresh agent.
+    """
     if not _listed_for_native_count(agent):
         return 0.0
-    ratio = getattr(getattr(agent, "context_compressor", None), "native_token_ratio", 0.0)
+    compressor = getattr(agent, "context_compressor", None)
+    ratio = getattr(compressor, "native_token_ratio", 0.0)
     if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and ratio > 0:
         return float(ratio)
+    if compressor is not None:
+        try:
+            compressor.native_token_ratio = _NATIVE_RATIO_SEED
+        except Exception:
+            pass
     return _NATIVE_RATIO_SEED
 
 
@@ -606,7 +617,10 @@ def build_turn_context(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
-    # HPD-1151: before any size check of this turn (see the helper).
+    # HPD-1151: before any size check of this turn (see the helper). Seeding
+    # the provider/estimate ratio here keeps trigger and compaction depth in
+    # the same units from the first turn of a fresh agent on.
+    native_token_ratio(agent)
     _dropped_sidecars = drop_replayed_user_sidecars(agent, messages, current_turn_user_idx)
     if _dropped_sidecars:
         logger.info(

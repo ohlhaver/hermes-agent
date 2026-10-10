@@ -2250,12 +2250,14 @@ def run_conversation(
                     # usage, so without this the entire advisor spend — usually
                     # the bulk of a MoA turn — is invisible in token counts.
                     _moa_ref_cost = None
+                    _ref_usage_added = False
                     _moa_client = getattr(agent, "client", None)
                     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
                         try:
                             _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
                             if _ref_usage is not None:
                                 canonical_usage = canonical_usage + _ref_usage
+                                _ref_usage_added = True
                         except Exception as _moa_acct_exc:  # pragma: no cover - defensive
                             logger.debug("MoA reference usage accounting failed: %s", _moa_acct_exc)
                     # Flush the full-turn MoA trace (references + aggregator I/O)
@@ -2295,11 +2297,14 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
-                    calibrate_native_token_ratio(
-                        agent,
-                        getattr(agent, "_hpd1151_rough_request_tokens", 0),
-                        prompt_tokens,
-                    )
+                    if _ref_usage_added is False:
+                        # HPD-1151. Not under MoA: reference usage is added
+                        # to prompt_tokens there and would inflate the ratio.
+                        calibrate_native_token_ratio(
+                            agent,
+                            getattr(agent, "_hpd1151_rough_request_tokens", 0),
+                            prompt_tokens,
+                        )
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
