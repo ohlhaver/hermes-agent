@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.context_compressor import ContextCompressor, _estimate_msg_budget_tokens
+from agent.context_compressor import ContextCompressor, _CHARS_PER_TOKEN, _estimate_msg_budget_tokens
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
 from agent.turn_context import compose_user_api_content, substitute_api_content
 
@@ -78,6 +78,31 @@ def compressor():
             summary_target_ratio=0.10,
             quiet_mode=True,
         )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user", "content": "clean", "api_content": "wire user"},
+        {"role": "assistant", "content": "clean", "api_content": "wire assistant"},
+        {"role": "system", "content": "clean", "api_content": "ignored"},
+        {"role": "tool", "content": "clean", "api_content": "ignored"},
+        {"role": "user", "content": "clean", "api_content": ""},
+        {"role": "user", "content": "clean", "api_content": ["ignored"]},
+    ],
+    ids=["user-sidecar", "assistant-sidecar", "system-role", "tool-role", "empty-sidecar", "non-string-sidecar"],
+)
+def test_api_content_matches_wire_substitution_without_mutation(message):
+    """Upstream 820106d4's cases: the budget mirrors ``substitute_api_content`` exactly."""
+    original = dict(message)
+    wire_message = dict(message)
+    substitute_api_content(wire_message)
+
+    tokens = _estimate_msg_budget_tokens(message)
+
+    expected_content = wire_message.get("content") or ""
+    assert tokens == len(expected_content) // _CHARS_PER_TOKEN + 10
+    assert message == original
 
 
 def test_sidecar_is_the_charged_content():
