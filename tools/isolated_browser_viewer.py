@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from tools.bot_desktop.rfb_filter import RfbClientFilter
+from tools.bot_desktop.rfb_server_filter import RfbServerFilter, allowed_encodings
 from tools.isolated_browser import BrowserBoundaryError
 
 MAX_FRAME = 65536
@@ -108,6 +109,14 @@ class NativeRfbViewer:
             return (self.boundary.lease.get().holder == self.boundary.lease.AGENT
                     or self.boundary.viewer_id == viewer_id)
 
+    def may_receive_clipboard(self, ws, viewer_id):
+        """HPD-1097: only the one open connection whose viewer holds human input right now.
+
+        A pane replaced under HPD-1141 has the same native viewer id as its successor, so the
+        connection itself is part of the check: a stream that is no longer ``connected`` gets
+        no clipboard even after the new pane takes over."""
+        return self.connected is ws and self.boundary.viewer_may_input(viewer_id)
+
     async def handle(self, ws):
         reader = writer = None
         tasks = []
@@ -126,7 +135,12 @@ class NativeRfbViewer:
             self.connected = ws
             reader, writer = await asyncio.open_unix_connection(str(self.socket_path))
             await ws.send('{"ready":true}')
-            gate = RfbClientFilter(lambda: self.boundary.viewer_may_input(viewer_id))
+            # HPD-1097: Xvnc sends its clipboard (launcher.sh -SendCutText=1); only the pane that
+            # holds human input right now receives it. The client gate limits SetEncodings to
+            # what the server gate can frame and tells it the negotiated pixel format.
+            clipboard = RfbServerFilter(lambda: self.may_receive_clipboard(ws, viewer_id))
+            gate = RfbClientFilter(lambda: self.boundary.viewer_may_input(viewer_id),
+                                   allow_encoding=allowed_encodings, on_pixel_format=clipboard.set_pixel_format)
 
             async def to_browser():
                 async for packet in ws:
@@ -146,7 +160,9 @@ class NativeRfbViewer:
                         return
                     if not self.may_view(viewer_id):
                         return
-                    await ws.send(cipher.encrypt(data))
+                    data = clipboard.feed(data)
+                    if data:
+                        await ws.send(cipher.encrypt(data))
 
             async def expires():
                 while self.may_view(viewer_id):

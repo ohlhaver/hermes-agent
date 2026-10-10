@@ -15,7 +15,7 @@ choice, then ``ClientInit`` (1 byte). ``ServerInit`` is server→client and neve
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Optional
 
 _INPUT_TYPES = {4, 5, 6, 251, 255}  # KeyEvent, PointerEvent, ClientCutText, SetDesktopSize, QEMU Extended KeyEvent
 
@@ -28,6 +28,10 @@ _FIXED = {
     150: 10, # EnableContinuousUpdates
     255: 12, # QEMU client message; sub-type 0 = Extended KeyEvent (the only one noVNC sends)
 }
+_SET_PIXEL_FORMAT = 0
+_FRAMEBUFFER_UPDATE_REQUEST = 3
+_ENABLE_CONTINUOUS_UPDATES = 150
+_EXTENDED_CAPS = 1 << 24
 _SET_ENCODINGS = 2
 _CLIENT_CUT_TEXT = 6
 _FENCE = 248
@@ -46,8 +50,16 @@ class RfbClientFilter:
     key or pointer event.
     """
 
-    def __init__(self, allow_input: Callable[[], bool]) -> None:
+    def __init__(self, allow_input: Callable[[], bool], *,
+                 allow_encoding: Optional[Callable[[int], bool]] = None,
+                 on_pixel_format: Optional[Callable[[bytes], None]] = None) -> None:
+        """``allow_encoding`` (HPD-1097) rewrites SetEncodings to the encodings the server-side
+        clipboard gate can frame; ``on_pixel_format`` hands each SetPixelFormat's 16-byte format to
+        that gate. Both default to off, which leaves the stream exactly as before."""
         self._allow_input = allow_input
+        self._allow_encoding = allow_encoding
+        self._on_pixel_format = on_pixel_format
+        self._requested_updates = False
         self._buf = bytearray()
         self._handshake_left = 12 + 1 + 1  # version + security type + ClientInit(shared flag)
 
@@ -73,10 +85,38 @@ class RfbClientFilter:
                 break
             msg = bytes(self._buf[:length])
             del self._buf[:length]
-            if msg[0] in _INPUT_TYPES and not self._allow_input():
+            if msg[0] in _INPUT_TYPES and not self._allow_input() and not self._capabilities_only(msg):
                 continue
+            if msg[0] == _SET_ENCODINGS and self._allow_encoding is not None:
+                kept = [msg[i:i + 4] for i in range(4, len(msg), 4)
+                        if self._allow_encoding(int.from_bytes(msg[i:i + 4], "big", signed=True))]
+                msg = msg[:2] + len(kept).to_bytes(2, "big") + b"".join(kept)
+            if msg[0] == _SET_PIXEL_FORMAT and self._on_pixel_format is not None:
+                # The server gate frames updates by pixel size. A format change while an update may
+                # already be on its way would desync it (and could pass a clipboard message), so it
+                # is only accepted before the first update request; noVNC sends it exactly then.
+                if self._requested_updates:
+                    raise ValueError("pixel format change after the first update request")
+                self._on_pixel_format(msg[4:20])
+            if msg[0] in (_FRAMEBUFFER_UPDATE_REQUEST, _ENABLE_CONTINUOUS_UPDATES):
+                self._requested_updates = True
             out += msg
         return bytes(out)
+
+    def _capabilities_only(self, msg: bytes) -> bool:
+        """HPD-1097: an extended-clipboard caps message carries no clipboard content (formats and
+        size limits only). With the server gate on, it passes for watchers too, so that a pane that
+        connects first and takes over afterwards (Hey HPD-1141) has told Xvnc what it supports."""
+        if self._allow_encoding is None or msg[0] != _CLIENT_CUT_TEXT or len(msg) < 12:
+            return False
+        length = int.from_bytes(msg[4:8], "big", signed=True)
+        flags = int.from_bytes(msg[8:12], "big")
+        if length >= 0 or not flags & _EXTENDED_CAPS:
+            return False
+        # Exactly flags plus one u32 size per format bit. Xvnc reads only that much of a caps
+        # message and parses anything after it as new client messages (TigerVNC
+        # SMsgReader::readExtendedClipboard), so a longer one could smuggle key or pointer input.
+        return -length == 4 + 4 * bin(flags & 0xFFFF).count("1")
 
     def _message_length(self) -> int | None:
         t = self._buf[0]

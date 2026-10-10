@@ -95,10 +95,14 @@ def clear_remote_clipboard(socket_path):
             if kind == 2:
                 continue
             if kind == 3:
+                # HPD-1097: Xvnc now sends its clipboard (-SendCutText=1), and its outgoing size is
+                # not bounded by -MaxCutText. Discard it in pieces here (never kept, logged or
+                # returned) so a large copy cannot fail the hand-back; 64 MiB stays a hard stop.
                 size = abs(int.from_bytes(read(7)[3:7], "big", signed=True))
-                if size > 256 * 1024:
+                if size > 64 * 1024 * 1024:
                     raise BrowserBoundaryError("unsafe_return")
-                read(size)
+                while size:
+                    size -= len(read(min(size, 65536)))
                 continue
             raise BrowserBoundaryError("unsafe_return")
         raise BrowserBoundaryError("unsafe_return")
