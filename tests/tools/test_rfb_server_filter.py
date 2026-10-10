@@ -267,6 +267,13 @@ def test_client_caps_pass_for_a_watcher_but_client_content_does_not():
     provide = b"\x06\x00\x00\x00" + struct.pack(">i", -(4 + len(SECRET))) + struct.pack(">I", (1 << 28) | 1) + SECRET
     plain = b"\x06\x00\x00\x00" + struct.pack(">i", len(SECRET)) + SECRET
     assert gate.feed(caps + provide + plain) == caps
+    # A caps message longer than its format sizes would let Xvnc parse the tail as input: dropped whole.
+    key = struct.pack(">BBHI", 4, 1, 0, ord("a")) + struct.pack(">BBHI", 4, 0, 0, ord("a"))
+    smuggled = (b"\x06\x00\x00\x00" + struct.pack(">i", -(8 + len(key))) + struct.pack(">I", (1 << 24) | 1)
+                + struct.pack(">I", 0) + key)
+    assert gate.feed(smuggled) == b""
+    short = b"\x06\x00\x00\x00" + struct.pack(">i", -4) + struct.pack(">I", (1 << 24) | 1)
+    assert gate.feed(short) == b""
     old = RfbClientFilter(lambda: False)  # without the server gate nothing changes: caps stay gated too
     old.feed(b"RFB 003.008\n\x01\x00")
     assert old.feed(caps) == b""

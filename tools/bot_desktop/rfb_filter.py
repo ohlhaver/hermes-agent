@@ -109,9 +109,14 @@ class RfbClientFilter:
         connects first and takes over afterwards (Hey HPD-1141) has told Xvnc what it supports."""
         if self._allow_encoding is None or msg[0] != _CLIENT_CUT_TEXT or len(msg) < 12:
             return False
-        if int.from_bytes(msg[4:8], "big", signed=True) >= 0:
+        length = int.from_bytes(msg[4:8], "big", signed=True)
+        flags = int.from_bytes(msg[8:12], "big")
+        if length >= 0 or not flags & _EXTENDED_CAPS:
             return False
-        return bool(int.from_bytes(msg[8:12], "big") & _EXTENDED_CAPS)
+        # Exactly flags plus one u32 size per format bit. Xvnc reads only that much of a caps
+        # message and parses anything after it as new client messages (TigerVNC
+        # SMsgReader::readExtendedClipboard), so a longer one could smuggle key or pointer input.
+        return -length == 4 + 4 * bin(flags & 0xFFFF).count("1")
 
     def _message_length(self) -> int | None:
         t = self._buf[0]
