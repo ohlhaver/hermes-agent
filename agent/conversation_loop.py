@@ -34,7 +34,9 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     build_turn_context,
+    calibrate_native_token_ratio,
     compose_user_api_content,
+    trigger_pressure_tokens,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -1113,6 +1115,11 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
+        # HPD-1151: for the listed models the estimate is scaled into provider
+        # units (see trigger_pressure_tokens); the unscaled estimate of this
+        # request is kept to calibrate the ratio from its response.
+        agent._hpd1151_rough_request_tokens = request_pressure_tokens
+        request_pressure_tokens = trigger_pressure_tokens(agent, request_pressure_tokens)
         total_chars = approx_tokens * 4
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -2243,12 +2250,14 @@ def run_conversation(
                     # usage, so without this the entire advisor spend — usually
                     # the bulk of a MoA turn — is invisible in token counts.
                     _moa_ref_cost = None
+                    _ref_usage_added = False
                     _moa_client = getattr(agent, "client", None)
                     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
                         try:
                             _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
                             if _ref_usage is not None:
                                 canonical_usage = canonical_usage + _ref_usage
+                                _ref_usage_added = True
                         except Exception as _moa_acct_exc:  # pragma: no cover - defensive
                             logger.debug("MoA reference usage accounting failed: %s", _moa_acct_exc)
                     # Flush the full-turn MoA trace (references + aggregator I/O)
@@ -2288,6 +2297,14 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+                    if _ref_usage_added is False:
+                        # HPD-1151. Not under MoA: reference usage is added
+                        # to prompt_tokens there and would inflate the ratio.
+                        calibrate_native_token_ratio(
+                            agent,
+                            getattr(agent, "_hpd1151_rough_request_tokens", 0),
+                            prompt_tokens,
+                        )
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",

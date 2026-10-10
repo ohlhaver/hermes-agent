@@ -111,6 +111,151 @@ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
+def current_turn_sidecar_models_from_config(compression_cfg: Any) -> tuple:
+    """Parse ``compression.current_turn_sidecar_models`` (HPD-1151).
+
+    A list (or a single string) of model ids, compared lower-case. Anything
+    else, including the absent key, means no model: stock behaviour.
+    """
+    if not isinstance(compression_cfg, Mapping):
+        return ()
+    value = compression_cfg.get("current_turn_sidecar_models")
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return ()
+    models = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            model = item.strip().lower()
+            if model not in models:
+                models.append(model)
+    return tuple(models)
+
+
+def drop_replayed_user_sidecars(
+    agent: Any,
+    messages: List[Any],
+    current_turn_user_idx: int,
+) -> int:
+    """Stop older user rows from replaying their ``api_content`` (HPD-1151).
+
+    DELIBERATE DEVIATION FROM STOCK HERMES, enabled only for the models named
+    in ``compression.current_turn_sidecar_models`` (empty by default). Stock
+    Hermes replays every user row's injection sidecar (memory prefetch, plugin
+    context) so the provider cache prefix stays byte-stable. For Claude Haiku
+    5.5 a request above 100,000 prompt tokens is billed whole at the long
+    price (about 5x), and those sidecars kept the resting context near the
+    compaction threshold. Justus approved this for the fc-e2e-2 test on
+    2026-10-11 (HPD-1151).
+
+    Older user rows go out with their clean ``content``. Dropping the key here,
+    before the preflight estimate, is what makes every size check stop
+    counting them too (``estimate_messages_tokens_rough``, the compressor's
+    tail budget); a provider-request middleware would have left them counted.
+    The current turn's user row is never touched, so it carries its sidecar
+    for every model call of the turn, including after a mid-turn compaction.
+    Known cost: the previous turn's user row changes bytes once, so that
+    part of the prompt is read once without cache per turn. The same key also
+    carries the load-time sanitize-divergence sidecar; older user rows lose
+    that too and go out as their sanitized content. Rows rewritten by an
+    in-place compaction or a rotation are persisted without the dropped
+    sidecars, so they stay clean if the model is switched back.
+
+    Returns the number of sidecars dropped.
+    """
+    models = getattr(agent, "_current_turn_sidecar_models", None) or ()
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    if not model or model not in models:
+        return 0
+    dropped = 0
+    for idx, msg in enumerate(messages):
+        if idx == current_turn_user_idx or not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user" and "api_content" in msg:
+            # In place: the persist path identity-skips history dicts, so a
+            # copy here would be written again as a new row.
+            msg.pop("api_content", None)
+            dropped += 1
+    return dropped
+
+
+# HPD-1151: the provider's (native) prompt count for Claude Haiku 5.5 is about
+# 1.76x Hermes' chars/4 estimate. Measured on fc-e2e-2, 2026-10-10 20:30Z,
+# request composition (HPD-1127) id 13984e34: estimate 84,184 tokens
+# (336,739 chars), provider 148,151. 1.8 is the seed until the first response
+# of the agent calibrates it; the calibrated value is clamped to this range.
+_NATIVE_RATIO_SEED = 1.8
+_NATIVE_RATIO_MIN = 1.0
+_NATIVE_RATIO_MAX = 3.0
+
+
+def _listed_for_native_count(agent: Any) -> bool:
+    models = getattr(agent, "_current_turn_sidecar_models", None) or ()
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    return bool(model) and model in models
+
+
+def native_token_ratio(agent: Any) -> float:
+    """Provider-count / chars-4 ratio for a listed model, else 0.0 (off).
+
+    An uncalibrated compressor is seeded here, so the trigger and the
+    compressor's budgets (``_native_scaled``) always use the same value, also
+    for a compaction before the first response of a fresh agent.
+    """
+    if not _listed_for_native_count(agent):
+        return 0.0
+    compressor = getattr(agent, "context_compressor", None)
+    ratio = getattr(compressor, "native_token_ratio", 0.0)
+    if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and ratio > 0:
+        return float(ratio)
+    if compressor is not None:
+        try:
+            compressor.native_token_ratio = _NATIVE_RATIO_SEED
+        except Exception:
+            pass
+    return _NATIVE_RATIO_SEED
+
+
+def calibrate_native_token_ratio(agent: Any, rough_request_tokens: int, provider_prompt_tokens: int) -> None:
+    """Record provider-count / estimate for the request just answered (HPD-1151)."""
+    if not _listed_for_native_count(agent):
+        return
+    if not (isinstance(rough_request_tokens, int) and rough_request_tokens > 0):
+        return
+    if not (isinstance(provider_prompt_tokens, int) and provider_prompt_tokens > 0):
+        return
+    ratio = provider_prompt_tokens / rough_request_tokens
+    ratio = max(_NATIVE_RATIO_MIN, min(_NATIVE_RATIO_MAX, ratio))
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        try:
+            compressor.native_token_ratio = ratio
+        except Exception:
+            pass
+
+
+def trigger_pressure_tokens(agent: Any, rough_tokens: int) -> int:
+    """Context pressure for the preflight and pre-API compaction checks.
+
+    HPD-1151 (only for the models in ``compression.current_turn_sidecar_models``):
+    stock Hermes decides these checks on ``estimate_request_tokens_rough``
+    (chars/4). The price and the 100k long-price line of Claude Haiku 5.5
+    apply to the provider's own count, about 1.76x that estimate, so a
+    threshold on the estimate fired far above the line. For a listed model
+    the estimate is scaled into provider units by ``native_token_ratio``,
+    calibrated from the last answered request (seed 1.8). Because it scales
+    the current message list, a sidecar dropped at turn start is not counted
+    again. Unlisted models: the estimate, unchanged. The same pressure also
+    feeds the Ollama context-limit check, which never applies to a listed
+    model.
+    """
+    ratio = native_token_ratio(agent)
+    if ratio <= 0 or not isinstance(rough_tokens, int) or rough_tokens <= 0:
+        return rough_tokens
+    return int(rough_tokens * ratio)
+
+
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
     """Extract the ``api_content`` sidecar from a message dict for persistence.
 
@@ -472,6 +617,18 @@ def build_turn_context(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
+    # HPD-1151: before any size check of this turn (see the helper). Seeding
+    # the provider/estimate ratio here keeps trigger and compaction depth in
+    # the same units from the first turn of a fresh agent on.
+    native_token_ratio(agent)
+    _dropped_sidecars = drop_replayed_user_sidecars(agent, messages, current_turn_user_idx)
+    if _dropped_sidecars:
+        logger.info(
+            "HPD-1151 current-turn sidecar: dropped %d older user api_content "
+            "sidecar(s) for model=%s session=%s",
+            _dropped_sidecars, agent.model, agent.session_id or "none",
+        )
+
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
@@ -571,11 +728,11 @@ def build_turn_context(
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
     ):
-        _preflight_tokens = estimate_request_tokens_rough(
+        _preflight_tokens = trigger_pressure_tokens(agent, estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
-        )
+        ))
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,
@@ -656,11 +813,11 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = estimate_request_tokens_rough(
+                _preflight_tokens = trigger_pressure_tokens(agent, estimate_request_tokens_rough(
                     messages,
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
-                )
+                ))
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):

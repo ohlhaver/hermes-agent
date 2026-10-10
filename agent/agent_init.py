@@ -1667,6 +1667,16 @@ def init_agent(
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=False
     )
+    # HPD-1151: both default off; see drop_replayed_user_sidecars in
+    # agent/turn_context.py and _effective_protect_first_n in
+    # agent/context_compressor.py.
+    from agent.turn_context import current_turn_sidecar_models_from_config
+    agent._current_turn_sidecar_models = current_turn_sidecar_models_from_config(
+        _compression_cfg
+    )
+    compression_restart_summary_probe = is_truthy_value(
+        _compression_cfg.get("restart_summary_probe"), default=False
+    )
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"
     ).lower()
@@ -1922,6 +1932,7 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
+            restart_summary_probe=compression_restart_summary_probe,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
