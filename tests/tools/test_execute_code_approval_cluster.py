@@ -197,6 +197,133 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
     assert A.is_approved(gw_session, "execute_code") is False
 
 
+def test_guard_gateway_native_approval_returns_exact_execution_binding(gw_session):
+    binding = {
+        "key": "execute-code-native",
+        "payloadHash": "f" * 64,
+        "idempotencyKey": "execute-code-native",
+    }
+
+    def resolver(approval_data):
+        approval_data["execution_required"] = True
+        approval_data["execution"] = dict(binding)
+        with A._lock:
+            entry = A._gateway_queues[gw_session][-1]
+            entry.result = "once"
+            entry.event.set()
+
+    A.register_gateway_notify(gw_session, resolver)
+    result = A.check_execute_code_guard("print('approved')", "local")
+
+    assert result["approved"] is True
+    assert result["execution"] == binding
+    assert result["execution_session_key"] == gw_session
+
+
+def test_guard_gateway_native_approval_without_binding_fails_closed(gw_session):
+    def resolver(approval_data):
+        approval_data["execution_required"] = True
+        with A._lock:
+            entry = A._gateway_queues[gw_session][-1]
+            entry.result = "session"
+            entry.event.set()
+
+    A.register_gateway_notify(gw_session, resolver)
+    result = A.check_execute_code_guard("print('must not run')", "local")
+
+    assert result["approved"] is False
+    assert result["outcome"] == "binding_missing"
+    assert A.is_approved(gw_session, "execute_code") is False
+
+
+@pytest.mark.parametrize(
+    ("tool_result", "expected_outcome", "expected_exit_code"),
+    [
+        ({"status": "success", "exit_code": 0}, "executed", 0),
+        ({"status": "error", "error": "boom", "exit_code": 7}, "failed", 7),
+    ],
+)
+def test_execute_code_publishes_bound_real_outcome(
+    monkeypatch,
+    tool_result,
+    expected_outcome,
+    expected_exit_code,
+):
+    from tools import code_execution_tool as cet
+
+    session_key = "execute-code-receipt-session"
+    binding = {
+        "key": "execute-code-receipt",
+        "payloadHash": "1" * 64,
+        "idempotencyKey": "execute-code-receipt",
+    }
+    received = []
+
+    def fake_impl(code, task_id=None, enabled_tools=None, _approval_state=None):
+        claim = "execute_code:" + binding["idempotencyKey"]
+        assert A.register_gateway_tool_execution(session_key, claim, binding)
+        _approval_state.update({
+            "session_key": session_key,
+            "execution": dict(binding),
+            "claim": claim,
+        })
+        return json.dumps(tool_result)
+
+    monkeypatch.setattr(cet, "_execute_code_impl", fake_impl)
+    A.register_gateway_execution_notify(session_key, received.append)
+    try:
+        result = json.loads(cet.execute_code("print('x')", task_id=session_key))
+    finally:
+        A.unregister_gateway_notify(session_key)
+
+    assert result == tool_result
+    assert received == [{
+        "execution": binding,
+        "outcome": expected_outcome,
+        "exitCode": expected_exit_code,
+    }]
+
+
+def test_execute_code_does_not_dispatch_without_live_outcome_channel(monkeypatch):
+    from tools import code_execution_tool as cet
+    from tools import terminal_tool as terminal_mod
+
+    binding = {
+        "key": "execute-code-no-channel",
+        "payloadHash": "7" * 64,
+        "idempotencyKey": "execute-code-no-channel",
+    }
+    remote_calls = []
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "_get_env_config",
+        lambda: {"env_type": "ssh", "task_id": "no-channel"},
+    )
+    monkeypatch.setattr(terminal_mod, "_docker_has_host_access", lambda config: False)
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda *args, **kwargs: {
+            "approved": True,
+            "user_approved": True,
+            "execution": binding,
+            "execution_session_key": "missing-callback-session",
+        },
+    )
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *args, **kwargs: remote_calls.append((args, kwargs)),
+    )
+
+    result = json.loads(cet.execute_code("print('must not run')"))
+
+    assert result["status"] == "error"
+    assert "outcome channel is unavailable" in result["error"]
+    assert remote_calls == []
+
+
 def test_guard_gateway_user_approves_session_persists(gw_session):
     """'Approve session' stores session-level approval (#39275)."""
     _register_resolver(gw_session, "session")

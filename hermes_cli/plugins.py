@@ -135,6 +135,9 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
+    # A bridge can reject nested arguments before the underlying tool and its
+    # pre/post hooks run. Observers receive shape metadata, never arguments.
+    "tool_bridge_error",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
@@ -2272,6 +2275,46 @@ def resolve_pre_tool_block(
             return str(
                 result.get("message")
                 or f"BLOCKED: plugin approval required for {tool_name}"
+            )
+        execution = result.get("execution")
+        if isinstance(execution, dict):
+            try:
+                from tools.approval import (
+                    notify_gateway_execution,
+                    register_gateway_tool_execution,
+                )
+
+                execution_session_key = str(
+                    result.get("execution_session_key") or session_id or task_id or ""
+                )
+                if register_gateway_tool_execution(
+                    execution_session_key,
+                    tool_call_id,
+                    execution,
+                ):
+                    return None
+                # The user approved a native card, but the dispatcher cannot
+                # bind that card to a unique tool completion. Close it as not
+                # executed and fail closed before the tool can have effects.
+                notify_gateway_execution(
+                    execution_session_key,
+                    execution,
+                    outcome="failed",
+                    exit_code=-1,
+                )
+                return (
+                    f"BLOCKED: approved {tool_name} call has no usable native "
+                    "execution binding; the tool was not executed"
+                )
+            except Exception:
+                return (
+                    f"BLOCKED: failed to bind approved {tool_name} call to its "
+                    "native execution outcome"
+                )
+        if result.get("execution_required"):
+            return (
+                f"BLOCKED: native approval for {tool_name} omitted its execution "
+                "binding; the tool was not executed"
             )
     return None
 

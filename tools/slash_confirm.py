@@ -96,12 +96,12 @@ def clear_if_stale(session_key: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -
         return False
 
 
-async def resolve(
+async def resolve_with_status(
     session_key: str,
     confirm_id: str,
     choice: str,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> Optional[str]:
+) -> tuple[bool, Optional[str]]:
     """Resolve a pending confirm.
 
     ``choice`` must be one of ``"once"``, ``"always"``, or ``"cancel"``.
@@ -115,20 +115,20 @@ async def resolve(
     with _lock:
         entry = _pending.get(session_key)
         if not entry:
-            return None
+            return False, None
         if entry.get("confirm_id") != confirm_id:
             # Stale confirm_id — superseded by a newer prompt on the same session.
-            return None
+            return False, None
         # Pop before we run the handler to prevent duplicate callbacks
         # (e.g. button double-click) from running it twice.
         _pending.pop(session_key, None)
         if time.time() - float(entry.get("created_at", 0) or 0) > timeout:
-            return None
+            return False, None
         handler = entry.get("handler")
         command = entry.get("command", "?")
 
     if not handler:
-        return None
+        return False, None
     try:
         result = await handler(choice)
     except Exception as exc:
@@ -136,8 +136,24 @@ async def resolve(
             "Slash-confirm handler for /%s raised: %s",
             command, exc, exc_info=True,
         )
-        return f"❌ Error handling confirmation: {exc}"
-    return result if isinstance(result, str) else None
+        return True, f"❌ Error handling confirmation: {exc}"
+    return True, result if isinstance(result, str) else None
+
+
+async def resolve(
+    session_key: str,
+    confirm_id: str,
+    choice: str,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    """Backward-compatible value-only resolver for existing adapters."""
+    _, result = await resolve_with_status(
+        session_key,
+        confirm_id,
+        choice,
+        timeout=timeout,
+    )
+    return result
 
 
 def resolve_sync_compat(

@@ -82,3 +82,26 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+@pytest.mark.parametrize("schedule, original_next, expected_next", [
+    ("0 8,17 * * *", "2026-09-11T08:00:00+02:00", "2026-09-11T08:00:00+02:00"),
+    ("15 8,17 * * *", "2026-09-11T08:15:00+02:00", "2026-09-11T08:15:00+02:00"),
+    ("every 60m", "2026-09-11T07:30:00+02:00", "2026-09-11T08:00:00+02:00"),
+    ("0 8,17 * * *", "2026-09-10T17:00:00+02:00", "2026-09-11T08:00:00+02:00"),
+])
+def test_manual_claim_preserves_future_calendar_but_advances_interval_and_overdue(
+    temp_home, monkeypatch, schedule, original_next, expected_next,
+):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from cron.jobs import create_job, update_job, get_job, claim_job_for_fire
+    now = datetime(2026, 9, 11, 7, tzinfo=ZoneInfo("Europe/Zurich"))
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+    job = create_job(prompt="x", schedule=schedule, name="manual")
+    update_job(job["id"], {"next_run_at": original_next})
+    assert claim_job_for_fire(job["id"])
+    claimed = get_job(job["id"])
+    assert claimed["next_run_at"] == expected_next
+    assert claimed["schedule"] == job["schedule"]
+    assert claimed["enabled"] == job["enabled"]

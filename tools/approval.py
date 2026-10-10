@@ -2043,6 +2043,29 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_execution_notify_cbs: dict[str, object] = {}
+_gateway_execution_receipts: dict[str, set[str]] = {}
+_gateway_execution_inflight: dict[str, set[str]] = {}
+# Plugin approvals are resolved before their tool dispatcher runs.  Keep the
+# exact native execution binding keyed by the model's tool_call_id until the
+# common post-tool seam observes the real outcome.
+_gateway_tool_execution_bindings: dict[str, dict] = {}
+
+
+def _normalize_gateway_execution_binding(execution: object) -> Optional[dict]:
+    """Return the exact native binding or ``None`` when it is incomplete."""
+    if not isinstance(execution, dict):
+        return None
+    key = str(execution.get("key") or "").strip()
+    payload_hash = str(execution.get("payloadHash") or "").strip()
+    receipt_id = str(execution.get("idempotencyKey") or "").strip()
+    if not key or not payload_hash or not receipt_id:
+        return None
+    return {
+        "key": key,
+        "payloadHash": payload_hash,
+        "idempotencyKey": receipt_id,
+    }
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2057,17 +2080,169 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
+def register_gateway_execution_notify(session_key: str, cb) -> None:
+    """Register the exact-run callback for an approved action's real outcome."""
+    with _lock:
+        _gateway_execution_notify_cbs[session_key] = cb
+        _gateway_execution_receipts.setdefault(session_key, set())
+        _gateway_execution_inflight.setdefault(session_key, set())
+
+
 def unregister_gateway_notify(session_key: str) -> None:
     """Unregister the per-session gateway approval callback.
 
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
     """
+    # A plugin dispatcher can be interrupted after approval but before its
+    # post-tool hook.  Close those native waits honestly before dropping the
+    # transport callback.  A recorded real outcome wins; otherwise teardown is
+    # a failed/not-executed receipt rather than a fabricated success.
+    with _lock:
+        pending_tool_calls = [
+            (tool_call_id, dict(record))
+            for tool_call_id, record in _gateway_tool_execution_bindings.items()
+            if record.get("session_key") == session_key
+        ]
+    for tool_call_id, record in pending_tool_calls:
+        complete_gateway_tool_execution(
+            tool_call_id,
+            outcome=record.get("outcome") or "failed",
+            exit_code=record.get("exit_code", -1),
+        )
+
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_execution_notify_cbs.pop(session_key, None)
+        _gateway_execution_receipts.pop(session_key, None)
+        _gateway_execution_inflight.pop(session_key, None)
+        for tool_call_id, record in list(_gateway_tool_execution_bindings.items()):
+            if record.get("session_key") == session_key:
+                _gateway_tool_execution_bindings.pop(tool_call_id, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
+
+
+def notify_gateway_execution(
+    session_key: str,
+    execution: dict,
+    *,
+    outcome: str,
+    exit_code: Optional[int] = None,
+) -> bool:
+    """Report one real outcome for one exactly-bound approval action.
+
+    The runtime approval id is the idempotency key.  A receipt is marked
+    delivered only after the callback succeeds.  An in-flight set prevents two
+    concurrent return paths from publishing the same successful receipt while
+    still allowing a later retry after a transient transport failure.
+    """
+    binding = _normalize_gateway_execution_binding(execution)
+    if outcome not in {"executed", "failed"} or binding is None:
+        return False
+    receipt_id = binding["idempotencyKey"]
+    with _lock:
+        callback = _gateway_execution_notify_cbs.get(session_key)
+        delivered = _gateway_execution_receipts.setdefault(session_key, set())
+        inflight = _gateway_execution_inflight.setdefault(session_key, set())
+        if callback is None or receipt_id in delivered or receipt_id in inflight:
+            return False
+        inflight.add(receipt_id)
+    try:
+        callback({
+            "execution": binding,
+            "outcome": outcome,
+            "exitCode": exit_code,
+        })
+    except Exception as exc:
+        logger.warning("Gateway approval execution receipt failed: %s", exc)
+        with _lock:
+            _gateway_execution_inflight.setdefault(session_key, set()).discard(receipt_id)
+        return False
+    with _lock:
+        _gateway_execution_inflight.setdefault(session_key, set()).discard(receipt_id)
+        # unregister_gateway_notify() may have removed the session while the
+        # callback was running.  Do not recreate delivered state after teardown.
+        delivered = _gateway_execution_receipts.get(session_key)
+        if delivered is not None:
+            delivered.add(receipt_id)
+    return True
+
+
+def register_gateway_tool_execution(
+    session_key: str,
+    tool_call_id: str,
+    execution: object,
+) -> bool:
+    """Bind a plugin-approved tool call to its native approval outcome card."""
+    binding = _normalize_gateway_execution_binding(execution)
+    call_id = str(tool_call_id or "").strip()
+    if not call_id or binding is None:
+        return False
+    with _lock:
+        receipt_id = binding["idempotencyKey"]
+        duplicate_receipt = any(
+            record.get("session_key") == session_key
+            and record.get("execution", {}).get("idempotencyKey") == receipt_id
+            for record in _gateway_tool_execution_bindings.values()
+        )
+        if (
+            _gateway_execution_notify_cbs.get(session_key) is None
+            or receipt_id in _gateway_execution_receipts.get(session_key, set())
+            or receipt_id in _gateway_execution_inflight.get(session_key, set())
+            or call_id in _gateway_tool_execution_bindings
+            or duplicate_receipt
+        ):
+            return False
+        _gateway_tool_execution_bindings[call_id] = {
+            "session_key": session_key,
+            "execution": binding,
+            "outcome": None,
+            "exit_code": None,
+        }
+    return True
+
+
+def has_gateway_tool_execution(tool_call_id: str) -> bool:
+    """Whether a model tool call owns a pending native execution binding."""
+    call_id = str(tool_call_id or "").strip()
+    if not call_id:
+        return False
+    with _lock:
+        return call_id in _gateway_tool_execution_bindings
+
+
+def complete_gateway_tool_execution(
+    tool_call_id: str,
+    *,
+    outcome: str,
+    exit_code: Optional[int] = None,
+) -> bool:
+    """Publish the observed outcome for a previously-bound plugin tool call."""
+    if outcome not in {"executed", "failed"}:
+        return False
+    call_id = str(tool_call_id or "").strip()
+    with _lock:
+        record = _gateway_tool_execution_bindings.get(call_id)
+        if record is None:
+            return False
+        record["outcome"] = outcome
+        record["exit_code"] = exit_code
+        session_key = str(record["session_key"])
+        execution = dict(record["execution"])
+    delivered = notify_gateway_execution(
+        session_key,
+        execution,
+        outcome=outcome,
+        exit_code=exit_code,
+    )
+    if delivered:
+        with _lock:
+            current = _gateway_tool_execution_bindings.get(call_id)
+            if current is record:
+                _gateway_tool_execution_bindings.pop(call_id, None)
+    return delivered
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2801,13 +2976,36 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
+            execution_required = bool(decision.get("execution_required"))
+            execution = _normalize_gateway_execution_binding(decision.get("execution"))
+            if execution_required and execution is None:
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: Native approval did not provide a valid execution "
+                        "binding. The approved action was not executed."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "binding_missing",
+                    "user_consent": False,
+                }
             if choice == "session":
                 approve_session(session_key, pattern_key)
             elif choice == "always":
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
-            return {"approved": True, "message": None}
+            result = {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "execution_required": execution_required,
+                "execution_session_key": session_key,
+            }
+            if execution is not None:
+                result["execution"] = execution
+            return result
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
@@ -3167,7 +3365,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    result = {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+    }
+    if "execution" in entry.data:
+        result["execution"] = entry.data.get("execution")
+    if entry.data.get("execution_required"):
+        result["execution_required"] = True
+    return result
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -3503,6 +3710,20 @@ def check_all_command_guards(command: str, env_type: str,
                     "deny_reason": deny_reason,
                 }
 
+            execution_required = bool(decision.get("execution_required"))
+            execution = _normalize_gateway_execution_binding(decision.get("execution"))
+            if execution_required and execution is None:
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: Native approval did not provide a valid execution "
+                        "binding. The approved command was not executed."
+                    ),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": "binding_missing",
+                    "user_consent": False,
+                }
             # A smart-DENY owner override is always one operation, even if an
             # older client returns "session" or "always". Manual and ESCALATE
             # choices retain their existing persistence semantics.
@@ -3514,9 +3735,17 @@ def check_all_command_guards(command: str, env_type: str,
                         approve_session(session_key, key)
                         approve_permanent(key)
                         save_permanent_allowlist(_permanent_approved)
-
-            return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+            result = {
+                "approved": True,
+                "message": None,
+                "user_approved": True,
+                "description": combined_desc,
+                "execution_required": execution_required,
+                "execution_session_key": session_key,
+            }
+            if execution is not None:
+                result["execution"] = execution
+            return result
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Return approval_required for backward compat. Redact secrets in the
@@ -3821,6 +4050,20 @@ def check_execute_code_guard(code: str, env_type: str,
             "deny_reason": deny_reason,
         }
 
+    execution_required = bool(decision.get("execution_required"))
+    execution = _normalize_gateway_execution_binding(decision.get("execution"))
+    if execution_required and execution is None:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Native approval did not provide a valid execution "
+                "binding. The approved execute_code script was not executed."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "binding_missing",
+            "user_consent": False,
+        }
     # Never persist a smart-DENY override under the coarse execute_code key;
     # doing so would approve unrelated future scripts. Manual and ESCALATE
     # decisions preserve their existing session/permanent behavior.
@@ -3832,9 +4075,17 @@ def check_execute_code_guard(code: str, env_type: str,
             approve_permanent(pattern_key)
             save_permanent_allowlist(_permanent_approved)
     # choice == "once": no persistence — approval lasts this single call only.
-
-    return {"approved": True, "message": None,
-            "user_approved": True, "description": description}
+    result = {
+        "approved": True,
+        "message": None,
+        "user_approved": True,
+        "description": description,
+        "execution_required": execution_required,
+        "execution_session_key": session_key,
+    }
+    if execution is not None:
+        result["execution"] = execution
+    return result
 
 
 # =========================================================================

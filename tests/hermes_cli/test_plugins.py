@@ -955,6 +955,97 @@ class TestResolvePreToolBlock:
         )
         assert resolve_pre_tool_block("write_file", {}) is None
 
+    def test_native_approve_binds_plugin_tool_to_real_post_outcome(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from model_tools import _emit_post_tool_call_hook
+        from tools import approval as approval_mod
+
+        session_key = "plugin-native-execution-session"
+        tool_call_id = "plugin-native-tool-call"
+        binding = {
+            "key": "plugin-native-execution",
+            "payloadHash": "2" * 64,
+            "idempotencyKey": "plugin-native-execution",
+        }
+        received = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "why"}
+            ],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *a, **k: {
+                "approved": True,
+                "message": None,
+                "execution": dict(binding),
+                "execution_required": True,
+                "execution_session_key": session_key,
+            },
+        )
+        approval_mod.register_gateway_execution_notify(session_key, received.append)
+        try:
+            assert resolve_pre_tool_block(
+                "write_file",
+                {"path": "safe.txt"},
+                tool_call_id=tool_call_id,
+            ) is None
+            _emit_post_tool_call_hook(
+                function_name="write_file",
+                function_args={"path": "safe.txt"},
+                result='{"status":"ok"}',
+                tool_call_id=tool_call_id,
+            )
+        finally:
+            approval_mod.unregister_gateway_notify(session_key)
+
+        assert received == [{
+            "execution": binding,
+            "outcome": "executed",
+            "exitCode": None,
+        }]
+
+    def test_native_approve_without_tool_call_id_fails_closed(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        from tools import approval as approval_mod
+
+        session_key = "plugin-native-missing-tool-call"
+        binding = {
+            "key": "plugin-native-missing-tool-call",
+            "payloadHash": "3" * 64,
+            "idempotencyKey": "plugin-native-missing-tool-call",
+        }
+        received = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "why"}
+            ],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *a, **k: {
+                "approved": True,
+                "message": None,
+                "execution": dict(binding),
+                "execution_required": True,
+                "execution_session_key": session_key,
+            },
+        )
+        approval_mod.register_gateway_execution_notify(session_key, received.append)
+        try:
+            block = resolve_pre_tool_block("write_file", {"path": "safe.txt"})
+        finally:
+            approval_mod.unregister_gateway_notify(session_key)
+
+        assert block is not None and "not executed" in block
+        assert received == [{
+            "execution": binding,
+            "outcome": "failed",
+            "exitCode": -1,
+        }]
+
     def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
 

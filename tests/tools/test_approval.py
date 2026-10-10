@@ -2363,6 +2363,27 @@ class TestApprovalTimeoutIsNotConsent:
         assert "NOT consented" in r["message"]
         assert "rephrase" in r["message"].lower()
 
+    def test_native_execution_binding_returns_with_the_exact_decision(self, monkeypatch):
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch, seconds=5)
+        binding = {
+            "key": "runtime-exact",
+            "payloadHash": "c" * 64,
+            "idempotencyKey": "runtime-exact",
+        }
+
+        def notify(data):
+            data["execution"] = dict(binding)
+            assert mod.resolve_gateway_approval(self.SESSION_KEY, "once") == 1
+
+        mod.register_gateway_notify(self.SESSION_KEY, notify)
+        result = mod.check_all_command_guards("rm -rf .git", "local")
+
+        assert result["approved"] is True
+        assert result["user_approved"] is True
+        assert result["execution"] == binding
+
     def test_timeout_emits_post_hook_with_timeout_outcome(self, monkeypatch):
         """Plugins must be able to distinguish timeout from explicit deny.
 
@@ -2561,3 +2582,148 @@ class TestApprovalPromptRedaction:
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+
+def test_gateway_execution_receipt_is_exact_and_idempotent():
+    from tools import approval as approval_mod
+
+    session_key = "receipt-exact-session"
+    received = []
+    binding = {
+        "key": "runtime-approval-1",
+        "payloadHash": "a" * 64,
+        "idempotencyKey": "runtime-approval-1",
+    }
+    approval_mod.register_gateway_execution_notify(session_key, received.append)
+    try:
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is True
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is False
+    finally:
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert received == [{
+        "execution": binding,
+        "outcome": "executed",
+        "exitCode": 0,
+    }]
+
+
+def test_gateway_execution_receipt_retries_after_transient_transport_failure():
+    from tools import approval as approval_mod
+
+    session_key = "receipt-retry-session"
+    binding = {
+        "key": "runtime-approval-retry",
+        "payloadHash": "d" * 64,
+        "idempotencyKey": "runtime-approval-retry",
+    }
+    received = []
+    attempts = 0
+
+    def flaky_callback(receipt):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary transport failure")
+        received.append(receipt)
+
+    approval_mod.register_gateway_execution_notify(session_key, flaky_callback)
+    try:
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is False
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is True
+        assert approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ) is False
+    finally:
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert attempts == 2
+    assert received == [{
+        "execution": binding,
+        "outcome": "executed",
+        "exitCode": 0,
+    }]
+
+
+def test_gateway_execution_receipt_blocks_concurrent_duplicate_delivery():
+    from tools import approval as approval_mod
+
+    session_key = "receipt-concurrent-session"
+    binding = {
+        "key": "runtime-approval-concurrent",
+        "payloadHash": "5" * 64,
+        "idempotencyKey": "runtime-approval-concurrent",
+    }
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    received = []
+    results = []
+
+    def blocking_callback(receipt):
+        received.append(receipt)
+        callback_started.set()
+        assert callback_release.wait(timeout=5)
+
+    approval_mod.register_gateway_execution_notify(session_key, blocking_callback)
+    try:
+        first = threading.Thread(
+            target=lambda: results.append(approval_mod.notify_gateway_execution(
+                session_key, binding, outcome="executed", exit_code=0,
+            )),
+        )
+        first.start()
+        assert callback_started.wait(timeout=5)
+        results.append(approval_mod.notify_gateway_execution(
+            session_key, binding, outcome="executed", exit_code=0,
+        ))
+        callback_release.set()
+        first.join(timeout=5)
+        assert not first.is_alive()
+    finally:
+        callback_release.set()
+        approval_mod.unregister_gateway_notify(session_key)
+
+    assert sorted(results) == [False, True]
+    assert len(received) == 1
+
+
+def test_pending_plugin_receipt_retries_during_callback_teardown():
+    from tools import approval as approval_mod
+
+    session_key = "plugin-receipt-teardown-session"
+    binding = {
+        "key": "plugin-receipt-teardown",
+        "payloadHash": "6" * 64,
+        "idempotencyKey": "plugin-receipt-teardown",
+    }
+    attempts = []
+
+    def flaky_callback(receipt):
+        attempts.append(receipt)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary transport failure")
+
+    approval_mod.register_gateway_execution_notify(session_key, flaky_callback)
+    assert approval_mod.register_gateway_tool_execution(
+        session_key, "plugin-call-teardown", binding,
+    )
+    assert approval_mod.complete_gateway_tool_execution(
+        "plugin-call-teardown", outcome="failed", exit_code=9,
+    ) is False
+
+    approval_mod.unregister_gateway_notify(session_key)
+
+    assert len(attempts) == 2
+    assert attempts[-1] == {
+        "execution": binding,
+        "outcome": "failed",
+        "exitCode": 9,
+    }

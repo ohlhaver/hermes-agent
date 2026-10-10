@@ -3027,6 +3027,29 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def send_commentary(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver completed interim assistant commentary.
+
+        Commentary is user-visible progress emitted between model/tool
+        iterations, not the final answer. Most messaging platforms should
+        present it as an ordinary message, so the default preserves the
+        historical ``send()`` behavior. Adapters with a native transient
+        activity surface may override this method without changing final-answer
+        delivery or conversation history.
+        """
+        return await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close

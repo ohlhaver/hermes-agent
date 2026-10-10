@@ -772,6 +772,13 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
+        # croniter 6 misadjusts ZoneInfo wall times across DST (08:00 becomes
+        # 07:00/09:00). Use its documented pytz representation of the same
+        # instant; pytz is already a required dependency of croniter.
+        zone_key = getattr(base_time.tzinfo, "key", None)
+        if zone_key:
+            import pytz
+            base_time = base_time.astimezone(pytz.timezone(zone_key))
         cron = croniter(expr, base_time)
         next_run = cron.get_next(datetime)
         return next_run.isoformat()

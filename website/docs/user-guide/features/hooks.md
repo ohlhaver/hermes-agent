@@ -380,6 +380,7 @@ def register(ctx):
 |------|-----------|---------|
 | [`pre_tool_call`](#pre_tool_call) | Before any tool executes | `{"action": "block", "message": str}` to veto the call |
 | [`post_tool_call`](#post_tool_call) | After any tool returns | ignored |
+| [`tool_bridge_error`](#tool_bridge_error) | A deferred `tool_call` contains invalid nested JSON, before any underlying tool runs | ignored |
 | [`pre_llm_call`](#pre_llm_call) | Once per turn, before the tool-calling loop | `{"context": str}` to prepend context to the user message |
 | [`post_llm_call`](#post_llm_call) | Once per turn, after the tool-calling loop | ignored |
 | [`pre_verify`](#pre_verify) | Once per turn when the agent edited code, before it verifies/finishes | `{"action": "continue", "message": str}` to keep going |
@@ -507,6 +508,12 @@ def register(ctx):
 ```
 
 ---
+
+### `tool_bridge_error`
+
+Fires when the `tool_call` bridge rejects a nested argument string that is not valid JSON. The underlying tool has not run, so its `pre_tool_call` and `post_tool_call` hooks do not fire. This observer receives only the authorized underlying tool name (or an empty string), `nested_arg_type`, a bounded `nested_arg_length_bucket`, `parser_class`, `dispatched=False`, and the opaque `turn_id` and `api_request_id`. It never receives the argument string, prompt, or tool result. Return values are ignored.
+
+Use it to correlate repeated bridge parse failures with a run without logging customer content. Treat the correlation identifiers as opaque; do not parse their string formats or include them in user-visible output.
 
 ### `pre_llm_call`
 
