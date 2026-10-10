@@ -180,6 +180,30 @@ def drop_replayed_user_sidecars(
     return dropped
 
 
+def trigger_pressure_tokens(agent: Any, rough_tokens: int) -> int:
+    """Context pressure for the preflight and pre-API compaction checks.
+
+    HPD-1151 (only for the models in ``compression.current_turn_sidecar_models``):
+    stock Hermes decides these two checks on ``estimate_request_tokens_rough``
+    (chars/4). For Claude Haiku 5.5 the provider-reported prompt, which is the
+    count the price and the 100k long-price line apply to, was about twice
+    that estimate on fc-e2e-2 (2026-10-10: estimate ~61k, provider 148,151),
+    so a threshold on the estimate fired far above the line. For a listed
+    model the last provider-reported prompt (``last_prompt_tokens``) is a
+    floor of the pressure. ``-1`` (compaction just ran, no reading yet,
+    #36718) and ``0`` (no usage) leave the estimate alone. The post-response
+    check in the tool loop already uses the provider count.
+    """
+    models = getattr(agent, "_current_turn_sidecar_models", None) or ()
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    if not model or model not in models:
+        return rough_tokens
+    last = getattr(getattr(agent, "context_compressor", None), "last_prompt_tokens", 0)
+    if isinstance(last, int) and not isinstance(last, bool) and last > rough_tokens:
+        return last
+    return rough_tokens
+
+
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
     """Extract the ``api_content`` sidecar from a message dict for persistence.
 
@@ -649,11 +673,11 @@ def build_turn_context(
         agent.context_compressor.protect_last_n,
         agent.context_compressor.threshold_tokens,
     ):
-        _preflight_tokens = estimate_request_tokens_rough(
+        _preflight_tokens = trigger_pressure_tokens(agent, estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
-        )
+        ))
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,

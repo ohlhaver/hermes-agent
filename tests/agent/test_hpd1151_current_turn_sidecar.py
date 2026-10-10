@@ -101,3 +101,68 @@ def test_config_parsing(value, expected):
     assert current_turn_sidecar_models_from_config({"current_turn_sidecar_models": value}) == expected
     assert current_turn_sidecar_models_from_config({}) == ()
     assert current_turn_sidecar_models_from_config(None) == ()
+
+
+# --- the trigger reads the provider's native count (HPD-1151, step 2b) ---
+#
+# Hermes' preflight and pre-API checks use estimate_request_tokens_rough
+# (chars/4). For Claude Haiku 5.5 the provider-reported (native) prompt was
+# about 2x that estimate on fc-e2e-2, so an 85k trigger on the estimate fired
+# near 170k native, far above the 100k long-price line. For the listed models
+# the last provider-reported prompt counts as a floor of the pressure.
+
+from agent.turn_context import trigger_pressure_tokens  # noqa: E402
+
+
+class _Compressor:
+    def __init__(self, last):
+        self.last_prompt_tokens = last
+
+
+def _pressure_agent(model, models, last):
+    agent = _agent(model, models)
+    agent.context_compressor = _Compressor(last)
+    return agent
+
+
+def test_pressure_uses_native_usage_for_listed_model():
+    agent = _pressure_agent(HAIKU, (HAIKU,), 90_000)
+    assert trigger_pressure_tokens(agent, 40_000) == 90_000
+    assert trigger_pressure_tokens(agent, 120_000) == 120_000
+
+
+def test_pressure_unchanged_for_unlisted_model_or_default():
+    assert trigger_pressure_tokens(_pressure_agent("deepseek/deepseek-v4", (HAIKU,), 90_000), 40_000) == 40_000
+    assert trigger_pressure_tokens(_pressure_agent(HAIKU, (), 90_000), 40_000) == 40_000
+
+
+def test_pressure_ignores_post_compaction_sentinel_and_missing_usage():
+    # -1 = compaction just ran, no provider reading yet (#36718); 0 = no usage.
+    assert trigger_pressure_tokens(_pressure_agent(HAIKU, (HAIKU,), -1), 40_000) == 40_000
+    assert trigger_pressure_tokens(_pressure_agent(HAIKU, (HAIKU,), 0), 40_000) == 40_000
+
+
+def test_preflight_compacts_on_native_usage_for_listed_model():
+    from unittest.mock import MagicMock
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
+        from agent.context_compressor import ContextCompressor
+
+        compressor = ContextCompressor(model=HAIKU, threshold_percent=0.08535, protect_first_n=0, protect_last_n=3, quiet_mode=True)
+    compressor.last_prompt_tokens = 90_000
+    compressor.last_real_prompt_tokens = 90_000
+    history = []
+    for i in range(10):
+        history.append({"role": "user", "content": f"short question {i}"})
+        history.append({"role": "assistant", "content": f"short answer {i}"})
+
+    def run(models):
+        agent = _agent(HAIKU, models)
+        agent.compression_enabled = True
+        agent.context_compressor = compressor
+        agent._compress_context = MagicMock(side_effect=lambda messages, *_a, **_k: (messages[-3:], "SYSTEM"))
+        _build(agent, conversation_history=list(history), user_message="next")
+        return agent._compress_context.call_count
+
+    assert run(()) == 0          # stock: the tiny estimate never reaches 85k
+    assert run((HAIKU,)) == 1    # listed: the 90k native reading does

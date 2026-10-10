@@ -35,6 +35,7 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
+    trigger_pressure_tokens,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -1113,6 +1114,9 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
+        # HPD-1151: for the listed models the last provider-reported prompt is
+        # a floor of the pressure (see trigger_pressure_tokens).
+        request_pressure_tokens = trigger_pressure_tokens(agent, request_pressure_tokens)
         total_chars = approx_tokens * 4
 
         _runtime_context_error = _ollama_context_limit_error(
