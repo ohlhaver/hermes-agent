@@ -436,7 +436,14 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
     compaction re-fires continuously (#55572).  Accounting-only: replay
     fields are never mutated or pruned here.
     """
-    content_len = _content_length_for_budget(msg.get("content") or "")
+    # Charge the wire substitute, not both it and the clean display content.
+    # HPD-1131: backport of upstream NousResearch/hermes-agent 820106d4
+    # ("fix(compaction): count api_content in tail budget", in main dce1e9b3),
+    # agent/context_compressor.py _estimate_msg_budget_tokens. Mirrors
+    # agent/turn_context.py substitute_api_content.
+    sidecar = msg.get("api_content")
+    content = sidecar if isinstance(sidecar, str) and sidecar and msg.get("role") in ("user", "assistant") else msg.get("content") or ""
+    content_len = _content_length_for_budget(content)
     tokens = content_len // _CHARS_PER_TOKEN + 10  # +10 for role/key overhead
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
