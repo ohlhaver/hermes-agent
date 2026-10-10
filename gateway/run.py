@@ -4910,6 +4910,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _reconcile_persisted_active_agents(self) -> None:
+        """Rewrite ``active_agents`` when the persisted value is out of date.
+
+        Cron jobs and API-server runs count toward ``_active_work_count`` but
+        start and finish outside ``_running_agents``, so no turn boundary
+        persists their end. A write made while a cron job ran (a chat turn
+        boundary, a lifecycle write) otherwise keeps ``active_agents`` at 1
+        after the job has finished, until the next messaging turn, and every
+        reader that waits for 0 waits for nothing (HPD-1148). Called from the
+        drain-control watcher on the event loop, so it never races the turn
+        boundary writes; it writes only when the value differs.
+        """
+        try:
+            from gateway.status import parse_active_agents, read_runtime_status
+            persisted = read_runtime_status()
+            if not isinstance(persisted, dict):
+                return
+            if parse_active_agents(persisted.get("active_agents")) != self._active_work_count():
+                self._persist_active_agents()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # External drain control (NAS-driven quiesce-without-restart, Phase 2).
     # The dashboard's begin/cancel-drain endpoint writes/removes the
@@ -4990,6 +5012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._persist_active_agents()
                 else:
                     self._exit_external_drain()
+                    self._reconcile_persisted_active_agents()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
