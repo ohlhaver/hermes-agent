@@ -166,6 +166,20 @@ class IsolatedBrowserBoundary:
                     self.ready_viewer = None
                     self.lease.acquire("revoked-session")
                     return {"revoked": True}
+                if method == "display.extend":
+                    # HPD-1119: the product binding slides with use instead of
+                    # ending 30 minutes after it started. Only the bound
+                    # management caller may move the end, only later, and never
+                    # beyond the same 30 minute (plus 5 s clock skew) bound the
+                    # constructor enforces; an expired session stays expired
+                    # because _bound above already refused it. The lease is not
+                    # touched: a human keeps control across an extension.
+                    new_expiry = request.get("expires_at")
+                    if (type(new_expiry) not in (int, float) or new_expiry != new_expiry
+                            or not self.expires_at <= new_expiry <= self.now() + 1800 + 5):
+                        raise BrowserBoundaryError("invalid_session")
+                    self.expires_at = float(new_expiry)
+                    return {"session_id": self.session_id, "expires_at": self.expires_at}
                 current = self._revision(request)
                 if method == "display.lease.acquire":
                     viewer = request.get("viewer_id")
