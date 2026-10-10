@@ -111,6 +111,71 @@ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
+def current_turn_sidecar_models_from_config(compression_cfg: Any) -> tuple:
+    """Parse ``compression.current_turn_sidecar_models`` (HPD-1151).
+
+    A list (or a single string) of model ids, compared lower-case. Anything
+    else, including the absent key, means no model: stock behaviour.
+    """
+    if not isinstance(compression_cfg, Mapping):
+        return ()
+    value = compression_cfg.get("current_turn_sidecar_models")
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return ()
+    models = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            model = item.strip().lower()
+            if model not in models:
+                models.append(model)
+    return tuple(models)
+
+
+def drop_replayed_user_sidecars(
+    agent: Any,
+    messages: List[Any],
+    current_turn_user_idx: int,
+) -> int:
+    """Stop older user rows from replaying their ``api_content`` (HPD-1151).
+
+    DELIBERATE DEVIATION FROM STOCK HERMES, enabled only for the models named
+    in ``compression.current_turn_sidecar_models`` (empty by default). Stock
+    Hermes replays every user row's injection sidecar (memory prefetch, plugin
+    context) so the provider cache prefix stays byte-stable. For Claude Haiku
+    5.5 a request above 100,000 prompt tokens is billed whole at the long
+    price (about 5x), and those sidecars kept the resting context near the
+    compaction threshold. Justus approved this for the fc-e2e-2 test on
+    2026-10-11 (HPD-1151).
+
+    Older user rows go out with their clean ``content``. Dropping the key here,
+    before the preflight estimate, is what makes every size check stop
+    counting them too (``estimate_messages_tokens_rough``, the compressor's
+    tail budget); a provider-request middleware would have left them counted.
+    The current turn's user row is never touched, so it carries its sidecar
+    for every model call of the turn, including after a mid-turn compaction.
+    Known cost: the previous turn's user row changes bytes once, so that
+    part of the prompt is read once without cache per turn.
+
+    Returns the number of sidecars dropped.
+    """
+    models = getattr(agent, "_current_turn_sidecar_models", None) or ()
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    if not model or model not in models:
+        return 0
+    dropped = 0
+    for idx, msg in enumerate(messages):
+        if idx == current_turn_user_idx or not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user" and "api_content" in msg:
+            # In place: the persist path identity-skips history dicts, so a
+            # copy here would be written again as a new row.
+            msg.pop("api_content", None)
+            dropped += 1
+    return dropped
+
+
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
     """Extract the ``api_content`` sidecar from a message dict for persistence.
 
@@ -471,6 +536,9 @@ def build_turn_context(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+
+    # HPD-1151: before any size check of this turn (see the helper).
+    drop_replayed_user_sidecars(agent, messages, current_turn_user_idx)
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1

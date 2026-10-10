@@ -265,6 +265,13 @@ _HISTORICAL_SUMMARY_PREFIXES = (
     "config, etc.) may reflect work described here — avoid repeating it:",
 )
 
+# HPD-1151: restart handoff detection (core of upstream 08ea88f4f7). It must be
+# early and bounded: it needs to catch the restored protected head plus a small
+# cluster of already-stacked handoff/ack turns, but it must not treat arbitrary
+# summary-looking live-tail messages as proof that this is a resumed compacted
+# session.
+_RESTART_HANDOFF_PROBE_EXTRA_MESSAGES = 4
+
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
 # Proportion of compressed content to allocate for summary
@@ -1326,6 +1333,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        restart_summary_probe: bool = False,
     ):
         self.model = model
         self.base_url = base_url
@@ -1349,6 +1357,13 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # HPD-1151 (config: compression.restart_summary_probe, default off).
+        # When True, _effective_protect_first_n probes the resumed head for a
+        # persisted handoff summary, so a gateway restart does not re-protect
+        # the old summary and add a second one at the next compaction. Off by
+        # default in this fork: Justus deferred the fix to the full upstream
+        # update (HPD-1139) and enabled it only for the fc-e2e-2 test.
+        self.restart_summary_probe = bool(restart_summary_probe)
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -2682,6 +2697,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         return bool(message.get(COMPRESSED_SUMMARY_METADATA_KEY))
 
     @classmethod
+    def _is_context_summary_message(cls, message: Any) -> bool:
+        """Return True for summary handoff messages by metadata or content."""
+        if not isinstance(message, dict):
+            return False
+        return cls._has_compressed_summary_metadata(
+            message
+        ) or cls._is_context_summary_content(message.get("content"))
+
+    @classmethod
     def _derive_auto_focus_topic(
         cls,
         messages: List[Dict[str, Any]],
@@ -2890,7 +2914,25 @@ This compaction should PRIORITISE preserving all information related to the focu
             idx += 1
         return idx
 
-    def _effective_protect_first_n(self) -> int:
+    def _restart_handoff_probe_bounds(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Return the bounded transcript region that can indicate restart decay."""
+        if not messages or self.protect_first_n <= 0:
+            return 0, 0
+        first_non_system = 1 if messages[0].get("role") == "system" else 0
+        return first_non_system, min(
+            len(messages),
+            first_non_system
+            + self.protect_first_n
+            + _RESTART_HANDOFF_PROBE_EXTRA_MESSAGES,
+        )
+
+    def _effective_protect_first_n(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
         """``protect_first_n`` decayed across compression cycles.
 
         ``protect_first_n`` keeps the first N non-system messages verbatim so
@@ -2902,9 +2944,28 @@ This compaction should PRIORITISE preserving all information related to the focu
         once, the early turns are already captured in the handoff summary, so
         there's no need to keep re-protecting them: decay to 0 (the system
         prompt is still always protected separately by _protect_head_size).
+
+        HPD-1151 (only with ``restart_summary_probe``): the decay state above
+        is in-memory, so a gateway restart forgot it and re-protected the
+        persisted handoff summary; the next compaction then added a second
+        one. Infer the decayed state from a handoff summary in the resumed
+        head region instead. Disk-persisted restarts rely on the content
+        prefix; the metadata branch covers in-process handoff messages.
         """
         if self.compression_count >= 1 or self._previous_summary:
             return 0
+        if self.restart_summary_probe and messages and self.protect_first_n > 0:
+            # Probe only the early handoff shape created by a resumed compacted
+            # session. Summary-looking tail content keeps normal tail
+            # semantics and does not decay the first-compaction protection.
+            first_non_system, restart_probe_end = self._restart_handoff_probe_bounds(
+                messages
+            )
+            if any(
+                self._is_context_summary_message(msg)
+                for msg in messages[first_non_system:restart_probe_end]
+            ):
+                return 0
         return self.protect_first_n
 
     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
@@ -2930,7 +2991,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         head = 0
         if messages and messages[0].get("role") == "system":
             head = 1
-        return head + self._effective_protect_first_n()
+        return head + self._effective_protect_first_n(messages)
 
     def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Pull a compress-end boundary backward to avoid splitting a
