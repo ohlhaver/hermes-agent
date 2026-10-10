@@ -156,7 +156,11 @@ def drop_replayed_user_sidecars(
     The current turn's user row is never touched, so it carries its sidecar
     for every model call of the turn, including after a mid-turn compaction.
     Known cost: the previous turn's user row changes bytes once, so that
-    part of the prompt is read once without cache per turn.
+    part of the prompt is read once without cache per turn. The same key also
+    carries the load-time sanitize-divergence sidecar; older user rows lose
+    that too and go out as their sanitized content. Rows rewritten by an
+    in-place compaction or a rotation are persisted without the dropped
+    sidecars, so they stay clean if the model is switched back.
 
     Returns the number of sidecars dropped.
     """
@@ -538,7 +542,13 @@ def build_turn_context(
     agent._persist_user_message_idx = current_turn_user_idx
 
     # HPD-1151: before any size check of this turn (see the helper).
-    drop_replayed_user_sidecars(agent, messages, current_turn_user_idx)
+    _dropped_sidecars = drop_replayed_user_sidecars(agent, messages, current_turn_user_idx)
+    if _dropped_sidecars:
+        logger.info(
+            "HPD-1151 current-turn sidecar: dropped %d older user api_content "
+            "sidecar(s) for model=%s session=%s",
+            _dropped_sidecars, agent.model, agent.session_id or "none",
+        )
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1

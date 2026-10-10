@@ -127,3 +127,53 @@ def test_metadata_flag_counts_as_summary():
     from agent import context_compressor as cc
     msgs[1] = {"role": "user", "content": "no prefix", cc.COMPRESSED_SUMMARY_METADATA_KEY: True}
     assert c._protect_head_size(msgs) == 1
+
+
+def test_head_turns_before_a_resumed_summary_are_summarized_not_dropped():
+    # After a first in-place compaction with protect_first_n=3 the persisted
+    # shape is [system, h1, h2, h3, summary, tail...]. With the probe the head
+    # decays, so h1-h3 fall into the window: they must reach the summarizer.
+    c = _compressor(probe=True)
+    msgs = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "HEAD-ONE original task"},
+        {"role": "assistant", "content": "HEAD-TWO original answer"},
+        {"role": "user", "content": "HEAD-THREE original follow-up"},
+        {"role": "assistant", "content": f"{SUMMARY_PREFIX}\nOLD-SUMMARY body"},
+        {"role": "user", "content": "first turn after resume"},
+        {"role": "assistant", "content": "first answer after resume"},
+        {"role": "user", "content": "second turn after resume"},
+        {"role": "assistant", "content": "second answer after resume"},
+        {"role": "user", "content": "third turn after resume"},
+        {"role": "assistant", "content": "latest tail response"},
+        {"role": "user", "content": "final active request stays in protected tail"},
+    ]
+    with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary")) as call:
+        result = c.compress(msgs)
+    prompt = call.call_args.kwargs["messages"][0]["content"]
+    for text in ("HEAD-ONE original task", "HEAD-TWO original answer", "HEAD-THREE original follow-up", "OLD-SUMMARY body"):
+        assert text in prompt
+    assert len(_summaries(result)) == 1
+
+
+def test_restart_handoff_without_system_still_starts_with_user():
+    # The auto path passes no system message; a decayed head then leaves no
+    # head at all and the summary is the first visible message, which
+    # Anthropic requires to be role=user (upstream 08ea88f4f7).
+    c = _compressor(probe=True)
+    msgs = [
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\nold persisted summary"},
+        {"role": "assistant", "content": "handoff acknowledged"},
+        {"role": "user", "content": "new work after restart"},
+        {"role": "assistant", "content": "new answer after restart"},
+        {"role": "user", "content": "more new work after restart"},
+        {"role": "assistant", "content": "more new answer after restart"},
+        {"role": "user", "content": "even more work"},
+        {"role": "assistant", "content": "even more answer"},
+        {"role": "user", "content": "tail request"},
+        {"role": "assistant", "content": "tail answer"},
+    ]
+    with patch("agent.context_compressor.call_llm", return_value=_response("summary of resumed turns")):
+        result = c.compress(msgs)
+    assert result[0]["role"] == "user"
+    assert "summary of resumed turns" in (result[0].get("content") or "")

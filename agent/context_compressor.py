@@ -3508,6 +3508,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             if summary_body and not self._previous_summary:
                 self._previous_summary = summary_body
             turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+            if self.restart_summary_probe and summary_idx > compress_start:
+                # HPD-1151 (part of upstream 08ea88f4f7): once the probe has
+                # decayed a resumed head, the old protected head sits in the
+                # window before the summary. Summarize it instead of dropping it.
+                turns_to_summarize = (
+                    messages[compress_start:summary_idx] + turns_to_summarize
+                )
         elif self._previous_summary:
             # No handoff summary found in the current messages, but
             # _previous_summary is non-empty — it was set by a different
@@ -3643,7 +3650,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Anthropic unconditionally rejects requests whose first message
         # is not role=user, so we must pin the summary to "user" and
         # prevent the flip logic below from reverting it (#52160).
-        _force_user_leading = last_head_role == "system"
+        _force_user_leading = last_head_role == "system" or (
+            # HPD-1151 (part of upstream 08ea88f4f7): with a decayed head and
+            # no system message in the list (the auto path), the summary is
+            # the first visible message and must be role=user for Anthropic.
+            self.restart_summary_probe and compress_start == 0
+        )
         # Zero-user-turn guard (#58753). The #52160 guard above only fires
         # when the system prompt sits *inside* ``messages`` (the gateway
         # ``/compress`` path). The main auto-compression path passes the
