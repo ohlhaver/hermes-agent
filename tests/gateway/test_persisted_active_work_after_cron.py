@@ -145,3 +145,32 @@ async def test_watcher_does_not_rewrite_an_accurate_count(monkeypatch):
 
     assert writes == []
     assert _persisted_active_agents() == 0
+
+
+@pytest.mark.asyncio
+async def test_finished_api_server_run_returns_persisted_active_agents_to_zero():
+    from unittest.mock import MagicMock
+
+    from gateway.config import Platform
+
+    api_runs = {"count": 1}
+    runner, _ = make_restart_runner()
+    runner._external_drain_active = False
+    runner.adapters = {
+        Platform.API_SERVER: MagicMock(active_agent_work_count=lambda: api_runs["count"])
+    }
+    write_runtime_status(gateway_state="running", active_agents=0)
+    runner._persist_active_agents()
+    assert _persisted_active_agents() == 1
+
+    watcher = asyncio.create_task(runner._drain_control_watcher(interval=0.02))
+    try:
+        api_runs["count"] = 0
+        assert await _wait_for(lambda: _persisted_active_agents() == 0)
+    finally:
+        runner._running = False
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
