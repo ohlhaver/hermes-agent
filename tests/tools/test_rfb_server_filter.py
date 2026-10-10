@@ -220,3 +220,132 @@ def test_replaced_pane_after_hpd1141_gets_no_clipboard(boundary):
     boundary.dispatch(boundary.management_uid, {"session_id": "run", "epoch": boundary.lease.get().epoch,
                                                 "method": "display.lease.release", "viewer_id": "viewer"})
     assert new.feed(cut_text(SECRET)) == b""
+
+
+TIGERVNC_CAPS = b"\x03\x00\x00\x00" + struct.pack(">i", -8) + struct.pack(">I", 0x1F000001) + struct.pack(">I", 20 << 20)
+
+
+@pytest.mark.parametrize("message,reaches_watcher", [
+    (TIGERVNC_CAPS, True),                                   # real TigerVNC caps: caps bit plus every action
+    (extended(REQUEST), True),
+    (extended(REQUEST | PROVIDE, b"\x00\x00\x00\x20" + SECRET), False),
+    (extended(NOTIFY | PROVIDE, b"\x00\x00\x00\x20" + SECRET), False),
+    (extended(PEEK | NOTIFY), False),
+    (extended(0, SECRET), False),
+])
+def test_extended_clipboard_actions_for_a_watcher(message, reaches_watcher):
+    gate = RfbServerFilter(lambda: False)
+    gate.feed(handshake())
+    assert gate.feed(message) == (message if reaches_watcher else b"")
+    holder = RfbServerFilter(lambda: True)
+    holder.feed(handshake())
+    assert holder.feed(message) == message
+
+
+def test_pixel_format_change_after_the_first_update_request_drops_the_connection():
+    """A watcher's modified client must not desync the server gate by switching format mid-stream."""
+    seen = []
+    gate = RfbClientFilter(lambda: False, allow_encoding=allowed_encodings, on_pixel_format=seen.append)
+    gate.feed(b"RFB 003.008\n\x01\x00")
+    pixel = b"\x00\x00\x00\x00" + FORMAT_888
+    request = struct.pack(">BBHHHH", 3, 0, 0, 0, 1440, 900)
+    assert gate.feed(pixel + request) == pixel + request
+    with pytest.raises(ValueError, match="pixel format"):
+        gate.feed(pixel)
+    assert seen == [FORMAT_888]
+    continuous = RfbClientFilter(lambda: False, allow_encoding=allowed_encodings, on_pixel_format=seen.append)
+    continuous.feed(b"RFB 003.008\n\x01\x00")
+    continuous.feed(b"\x96\x01" + b"\x00" * 8)
+    with pytest.raises(ValueError, match="pixel format"):
+        continuous.feed(pixel)
+
+
+def test_client_caps_pass_for_a_watcher_but_client_content_does_not():
+    gate = RfbClientFilter(lambda: False, allow_encoding=allowed_encodings, on_pixel_format=lambda _: None)
+    gate.feed(b"RFB 003.008\n\x01\x00")
+    caps = b"\x06\x00\x00\x00" + struct.pack(">i", -8) + struct.pack(">I", (1 << 24) | (1 << 25) | 1) + struct.pack(">I", 0)
+    provide = b"\x06\x00\x00\x00" + struct.pack(">i", -(4 + len(SECRET))) + struct.pack(">I", (1 << 28) | 1) + SECRET
+    plain = b"\x06\x00\x00\x00" + struct.pack(">i", len(SECRET)) + SECRET
+    assert gate.feed(caps + provide + plain) == caps
+    old = RfbClientFilter(lambda: False)  # without the server gate nothing changes: caps stay gated too
+    old.feed(b"RFB 003.008\n\x01\x00")
+    assert old.feed(caps) == b""
+
+
+def test_the_viewer_bridge_wires_both_gates_and_drops_the_stream_on_a_misframe(boundary):
+    """Through NativeRfbViewer.handle with a fake Xvnc socket and a fake WebSocket."""
+    import asyncio
+    import base64
+    import json
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from tools.isolated_browser_viewer import RfbCipher
+
+    import tempfile
+    from pathlib import Path
+    socket_path = Path(tempfile.mkdtemp(prefix="rfb", dir="/tmp")) / "s"  # AF_UNIX paths are short
+    noVNC = [7, 5, 0, EXTENDED_CLIPBOARD]
+    set_encodings = b"\x02\x00" + struct.pack(">H", len(noVNC)) + b"".join(struct.pack(">i", e) for e in noVNC)
+
+    async def scenario(server_tail):
+        received = bytearray()
+        sent_to_server = asyncio.Event()
+
+        async def xvnc(reader, writer):
+            writer.write(handshake() + cut_text(SECRET) + server_tail)
+            await writer.drain()
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                received.extend(data)
+                if set_encodings[:2] in received:
+                    sent_to_server.set()
+            writer.close()
+
+        server = await asyncio.start_unix_server(xvnc, path=str(socket_path))
+        viewer = NativeRfbViewer(boundary, socket_path)
+        minted = viewer.mint("viewer")
+        client_key = ec.generate_private_key(ec.SECP256R1())
+        client = RfbCipher(client_key, base64.b64decode(minted["server_public_key"]), session_id="run",
+                           viewer_id="viewer", server=False)
+        public = client_key.public_key().public_bytes(serialization.Encoding.X962,
+                                                      serialization.PublicFormat.UncompressedPoint)
+        inbox: asyncio.Queue = asyncio.Queue()
+        await inbox.put(json.dumps({"ticket": minted["ticket"], "client_public_key": base64.b64encode(public).decode()}))
+        await inbox.put(client.encrypt(b"RFB 003.008\n\x01\x00" + set_encodings))
+        outbox, closed = [], asyncio.Event()
+
+        class FakeSocket:
+            async def recv(self):
+                return await inbox.get()
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                if closed.is_set():
+                    raise StopAsyncIteration
+                item = await inbox.get()
+                if item is None:
+                    raise StopAsyncIteration
+                return item
+            async def send(self, data):
+                outbox.append(data)
+            async def close(self, code=1000, reason=""):
+                closed.set()
+
+        task = asyncio.create_task(viewer.handle(FakeSocket()))
+        await asyncio.wait_for(sent_to_server.wait(), 5)
+        await asyncio.sleep(0.2)
+        await inbox.put(None)
+        await asyncio.wait_for(task, 5)
+        server.close()
+        plaintext = b"".join(client.decrypt(item) for item in outbox if isinstance(item, bytes))
+        return plaintext, bytes(received), closed.is_set()
+
+    plaintext, to_server, closed = asyncio.run(scenario(b"\x02"))
+    assert SECRET not in plaintext and plaintext.startswith(handshake()) and plaintext.endswith(b"\x02")
+    kept = [7, 0, EXTENDED_CLIPBOARD]
+    assert b"\x02\x00" + struct.pack(">H", len(kept)) + b"".join(struct.pack(">i", e) for e in kept) in to_server
+    assert closed
+    plaintext, _, closed = asyncio.run(scenario(b"\xfa" + cut_text(SECRET)))  # unframed: stream ends
+    assert SECRET not in plaintext and closed

@@ -10,13 +10,15 @@ RFB server messages are not length-prefixed, so the stream is framed message by 
 (RFC 6143 §7.6 plus the TigerVNC extensions noVNC negotiates). Framebuffer rectangles are framed
 per encoding; to keep that finite, :func:`allowed_encodings` is applied to the client's
 SetEncodings by :class:`~tools.bot_desktop.rfb_filter.RfbClientFilter`, so the server can only
-use encodings this parser understands. Anything unknown raises: the viewer connection drops and
+use encodings this parser understands (newer noVNC extras such as ExtendedMouseButtons -316 or
+H.264 50 are stripped there and only lose a feature). Anything unknown raises: the viewer connection drops and
 reconnects, which is the safe failure (a misframed stream could otherwise hide a clipboard
 message).
 
 Clipboard rules for a viewer without input:
   * classic ServerCutText (content) — dropped;
-  * extended clipboard ``caps`` — forwarded: capability flags only, and without it noVNC would
+  * extended clipboard ``caps`` (caps bit set, whatever other action bits TigerVNC adds) —
+    forwarded: capability flags and size limits only, and without it noVNC would
     never use the extended protocol once the viewer takes over (HPD-1141 connects first, takes
     over after);
   * extended ``request`` — forwarded: the server asks the viewer for its clipboard, carries no
@@ -74,10 +76,6 @@ class PixelFormat:
         return 3 if is888 else self.bytes_per_pixel
 
 
-class _More(Exception):
-    """Not enough buffered bytes for the next step."""
-
-
 class RfbServerFilter:
     """Feed server bytes with :meth:`feed`; get back the bytes this viewer may receive.
 
@@ -108,7 +106,8 @@ class RfbServerFilter:
                 self._need = self._steps.send(None)
         except Exception:
             self._failed = True
-            self._buf.clear(); self._out.clear()
+            self._buf.clear()
+            self._out.clear()
             raise
         out = bytes(self._out)
         self._out.clear()
@@ -199,7 +198,9 @@ class RfbServerFilter:
             raise ValueError("extended clipboard message too short")
         flags = yield from self._take(4, forward=False)
         actions = int.from_bytes(flags, "big") & _ACTIONS
-        forward = bool(self._allow()) or actions in (_CAPS, _REQUEST)
+        # A set caps bit makes the whole message a caps message (TigerVNC sends caps with every action
+        # it supports, 0x1F000001; noVNC reads isCaps first and nothing else of it).
+        forward = bool(self._allow()) or bool(actions & _CAPS) or actions == _REQUEST
         if forward:
             self._out += b"\x03" + header + flags
         yield from self._skip(size - 4, forward)
@@ -212,7 +213,7 @@ class RfbServerFilter:
         index = 0
         while rects == 0xFFFF or index < rects:
             index += 1
-            x, y, w, h = [int.from_bytes(part, "big") for part in _split((yield from self._take(8)), 2)]
+            _x, _y, w, h = [int.from_bytes(part, "big") for part in _split((yield from self._take(8)), 2)]
             encoding = yield from self._s32()
             if encoding == LAST_RECT:
                 return
