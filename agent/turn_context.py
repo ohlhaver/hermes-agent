@@ -180,28 +180,69 @@ def drop_replayed_user_sidecars(
     return dropped
 
 
+# HPD-1151: the provider's (native) prompt count for Claude Haiku 5.5 is about
+# 1.76x Hermes' chars/4 estimate. Measured on fc-e2e-2, 2026-10-10 20:30Z,
+# request composition (HPD-1127) id 13984e34: estimate 84,184 tokens
+# (336,739 chars), provider 148,151. 1.8 is the seed until the first response
+# of the agent calibrates it; the calibrated value is clamped to this range.
+_NATIVE_RATIO_SEED = 1.8
+_NATIVE_RATIO_MIN = 1.0
+_NATIVE_RATIO_MAX = 3.0
+
+
+def _listed_for_native_count(agent: Any) -> bool:
+    models = getattr(agent, "_current_turn_sidecar_models", None) or ()
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    return bool(model) and model in models
+
+
+def native_token_ratio(agent: Any) -> float:
+    """Provider-count / chars-4 ratio for a listed model, else 0.0 (off)."""
+    if not _listed_for_native_count(agent):
+        return 0.0
+    ratio = getattr(getattr(agent, "context_compressor", None), "native_token_ratio", 0.0)
+    if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and ratio > 0:
+        return float(ratio)
+    return _NATIVE_RATIO_SEED
+
+
+def calibrate_native_token_ratio(agent: Any, rough_request_tokens: int, provider_prompt_tokens: int) -> None:
+    """Record provider-count / estimate for the request just answered (HPD-1151)."""
+    if not _listed_for_native_count(agent):
+        return
+    if not (isinstance(rough_request_tokens, int) and rough_request_tokens > 0):
+        return
+    if not (isinstance(provider_prompt_tokens, int) and provider_prompt_tokens > 0):
+        return
+    ratio = provider_prompt_tokens / rough_request_tokens
+    ratio = max(_NATIVE_RATIO_MIN, min(_NATIVE_RATIO_MAX, ratio))
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        try:
+            compressor.native_token_ratio = ratio
+        except Exception:
+            pass
+
+
 def trigger_pressure_tokens(agent: Any, rough_tokens: int) -> int:
     """Context pressure for the preflight and pre-API compaction checks.
 
     HPD-1151 (only for the models in ``compression.current_turn_sidecar_models``):
-    stock Hermes decides these two checks on ``estimate_request_tokens_rough``
-    (chars/4). For Claude Haiku 5.5 the provider-reported prompt, which is the
-    count the price and the 100k long-price line apply to, was about twice
-    that estimate on fc-e2e-2 (2026-10-10: estimate ~61k, provider 148,151),
-    so a threshold on the estimate fired far above the line. For a listed
-    model the last provider-reported prompt (``last_prompt_tokens``) is a
-    floor of the pressure. ``-1`` (compaction just ran, no reading yet,
-    #36718) and ``0`` (no usage) leave the estimate alone. The post-response
-    check in the tool loop already uses the provider count.
+    stock Hermes decides these checks on ``estimate_request_tokens_rough``
+    (chars/4). The price and the 100k long-price line of Claude Haiku 5.5
+    apply to the provider's own count, about 1.76x that estimate, so a
+    threshold on the estimate fired far above the line. For a listed model
+    the estimate is scaled into provider units by ``native_token_ratio``,
+    calibrated from the last answered request (seed 1.8). Because it scales
+    the current message list, a sidecar dropped at turn start is not counted
+    again. Unlisted models: the estimate, unchanged. The same pressure also
+    feeds the Ollama context-limit check, which never applies to a listed
+    model.
     """
-    models = getattr(agent, "_current_turn_sidecar_models", None) or ()
-    model = str(getattr(agent, "model", "") or "").strip().lower()
-    if not model or model not in models:
+    ratio = native_token_ratio(agent)
+    if ratio <= 0 or not isinstance(rough_tokens, int) or rough_tokens <= 0:
         return rough_tokens
-    last = getattr(getattr(agent, "context_compressor", None), "last_prompt_tokens", 0)
-    if isinstance(last, int) and not isinstance(last, bool) and last > rough_tokens:
-        return last
-    return rough_tokens
+    return int(rough_tokens * ratio)
 
 
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
@@ -758,11 +799,11 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = estimate_request_tokens_rough(
+                _preflight_tokens = trigger_pressure_tokens(agent, estimate_request_tokens_rough(
                     messages,
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
-                )
+                ))
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):

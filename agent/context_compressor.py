@@ -1223,6 +1223,8 @@ class ContextCompressor(ContextEngine):
         self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
+        # HPD-1151: the provider/estimate ratio belongs to the previous model.
+        self.native_token_ratio = 0.0
         self.last_compression_rough_tokens = 0
         self.awaiting_real_usage_after_compression = False
         self._ineffective_compression_count = 0
@@ -1364,6 +1366,12 @@ class ContextCompressor(ContextEngine):
         # default in this fork: Justus deferred the fix to the full upstream
         # update (HPD-1139) and enabled it only for the fc-e2e-2 test.
         self.restart_summary_probe = bool(restart_summary_probe)
+        # HPD-1151: provider-count / chars-4 ratio for a model listed in
+        # compression.current_turn_sidecar_models, set by the turn loop
+        # (agent/turn_context.py calibrate_native_token_ratio). 0.0 = off.
+        # When set, the tail and summary budgets are divided by it so a
+        # compaction lands where the threshold means it, in provider units.
+        self.native_token_ratio = 0.0
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -1843,7 +1851,20 @@ class ContextCompressor(ContextEngine):
         """
         content_tokens = estimate_messages_tokens_rough(turns_to_summarize)
         budget = int(content_tokens * _SUMMARY_RATIO)
-        return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
+        return max(_MIN_SUMMARY_TOKENS, min(budget, self._native_scaled(self.max_summary_tokens)))
+
+    def _native_scaled(self, budget: int) -> int:
+        """HPD-1151: a budget in provider units expressed in chars/4 units.
+
+        Budgets here are compared with chars/4 estimates, while the threshold
+        they derive from is in the provider's units (its usage drives the
+        trigger). With ``native_token_ratio`` set (only for listed models) the
+        budget is divided by it; otherwise it is returned unchanged.
+        """
+        ratio = getattr(self, "native_token_ratio", 0.0) or 0.0
+        if ratio <= 1.0:
+            return budget
+        return max(1, int(budget / ratio))
 
     # Truncation limits for the summarizer input.  These bound how much of
     # each message the summary model sees — the budget is the *summary*
@@ -3264,7 +3285,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
         """
         if token_budget is None:
-            token_budget = self.tail_token_budget
+            token_budget = self._native_scaled(self.tail_token_budget)
         n = len(messages)
         # Hard minimum: always keep a bounded recent-message floor in the tail.
         # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
@@ -3460,7 +3481,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
+            protect_tail_tokens=self._native_scaled(self.tail_token_budget),
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)

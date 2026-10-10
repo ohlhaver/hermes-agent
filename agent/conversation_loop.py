@@ -34,6 +34,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     build_turn_context,
+    calibrate_native_token_ratio,
     compose_user_api_content,
     trigger_pressure_tokens,
     reanchor_current_turn_user_idx,
@@ -1114,8 +1115,10 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
-        # HPD-1151: for the listed models the last provider-reported prompt is
-        # a floor of the pressure (see trigger_pressure_tokens).
+        # HPD-1151: for the listed models the estimate is scaled into provider
+        # units (see trigger_pressure_tokens); the unscaled estimate of this
+        # request is kept to calibrate the ratio from its response.
+        agent._hpd1151_rough_request_tokens = request_pressure_tokens
         request_pressure_tokens = trigger_pressure_tokens(agent, request_pressure_tokens)
         total_chars = approx_tokens * 4
 
@@ -2292,6 +2295,11 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+                    calibrate_native_token_ratio(
+                        agent,
+                        getattr(agent, "_hpd1151_rough_request_tokens", 0),
+                        prompt_tokens,
+                    )
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",

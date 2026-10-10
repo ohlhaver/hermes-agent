@@ -103,66 +103,120 @@ def test_config_parsing(value, expected):
     assert current_turn_sidecar_models_from_config(None) == ()
 
 
-# --- the trigger reads the provider's native count (HPD-1151, step 2b) ---
+# --- compaction in provider units (HPD-1151) ---
 #
-# Hermes' preflight and pre-API checks use estimate_request_tokens_rough
-# (chars/4). For Claude Haiku 5.5 the provider-reported (native) prompt was
-# about 2x that estimate on fc-e2e-2, so an 85k trigger on the estimate fired
-# near 170k native, far above the 100k long-price line. For the listed models
-# the last provider-reported prompt counts as a floor of the pressure.
+# Hermes' preflight and pre-API checks and its tail/summary budgets work in
+# chars/4 units. Claude Haiku 5.5's provider count, which the price and the
+# 100k long-price line use, was 1.76x that on fc-e2e-2 (estimate 84,184,
+# provider 148,151). For the listed models the estimate is scaled by a ratio
+# calibrated from the last answered request (seed 1.8), and the tail and
+# summary budgets are divided by it.
 
-from agent.turn_context import trigger_pressure_tokens  # noqa: E402
+from agent.turn_context import (  # noqa: E402
+    calibrate_native_token_ratio,
+    native_token_ratio,
+    trigger_pressure_tokens,
+)
 
 
 class _Compressor:
-    def __init__(self, last):
+    def __init__(self, ratio=0.0, last=0):
+        self.native_token_ratio = ratio
         self.last_prompt_tokens = last
 
 
-def _pressure_agent(model, models, last):
+def _ratio_agent(model, models, ratio=0.0, last=0):
     agent = _agent(model, models)
-    agent.context_compressor = _Compressor(last)
+    agent.context_compressor = _Compressor(ratio, last)
     return agent
 
 
-def test_pressure_uses_native_usage_for_listed_model():
-    agent = _pressure_agent(HAIKU, (HAIKU,), 90_000)
-    assert trigger_pressure_tokens(agent, 40_000) == 90_000
-    assert trigger_pressure_tokens(agent, 120_000) == 120_000
+def test_unlisted_or_default_is_the_bare_estimate():
+    assert trigger_pressure_tokens(_ratio_agent("deepseek/deepseek-v4", (HAIKU,), 1.76), 50_000) == 50_000
+    assert trigger_pressure_tokens(_ratio_agent(HAIKU, (), 1.76), 50_000) == 50_000
+    assert native_token_ratio(_ratio_agent(HAIKU, ())) == 0.0
 
 
-def test_pressure_unchanged_for_unlisted_model_or_default():
-    assert trigger_pressure_tokens(_pressure_agent("deepseek/deepseek-v4", (HAIKU,), 90_000), 40_000) == 40_000
-    assert trigger_pressure_tokens(_pressure_agent(HAIKU, (), 90_000), 40_000) == 40_000
+def test_listed_model_uses_seed_then_calibrated_ratio():
+    agent = _ratio_agent(HAIKU, (HAIKU,))
+    assert trigger_pressure_tokens(agent, 50_000) == 90_000          # seed 1.8
+    calibrate_native_token_ratio(agent, 84_184, 148_151)            # fc-e2e-2 measurement
+    assert round(agent.context_compressor.native_token_ratio, 2) == 1.76
+    assert trigger_pressure_tokens(agent, 50_000) == int(50_000 * 148_151 / 84_184)
 
 
-def test_pressure_ignores_post_compaction_sentinel_and_missing_usage():
-    # -1 = compaction just ran, no provider reading yet (#36718); 0 = no usage.
-    assert trigger_pressure_tokens(_pressure_agent(HAIKU, (HAIKU,), -1), 40_000) == 40_000
-    assert trigger_pressure_tokens(_pressure_agent(HAIKU, (HAIKU,), 0), 40_000) == 40_000
+def test_calibration_is_clamped_and_ignores_bad_readings():
+    agent = _ratio_agent(HAIKU, (HAIKU,), 1.5)
+    calibrate_native_token_ratio(agent, 10_000, 90_000)
+    assert agent.context_compressor.native_token_ratio == 3.0
+    calibrate_native_token_ratio(agent, 10_000, 5_000)
+    assert agent.context_compressor.native_token_ratio == 1.0
+    for rough, prompt in ((0, 90_000), (10_000, 0), (10_000, -1)):
+        calibrate_native_token_ratio(agent, rough, prompt)
+        assert agent.context_compressor.native_token_ratio == 1.0
+    other = _ratio_agent("deepseek/deepseek-v4", (HAIKU,))
+    calibrate_native_token_ratio(other, 10_000, 20_000)
+    assert other.context_compressor.native_token_ratio == 0.0
 
 
-def test_preflight_compacts_on_native_usage_for_listed_model():
-    from unittest.mock import MagicMock
+def test_dropped_sidecar_is_not_counted_again_by_the_trigger():
+    # A stale provider reading that still contained the previous turn's
+    # sidecar must not force a compaction: the pressure follows the current
+    # message list, not last_prompt_tokens.
+    agent = _ratio_agent(HAIKU, (HAIKU,), 1.76, last=150_000)
+    assert trigger_pressure_tokens(agent, 40_000) == int(40_000 * 1.76)
 
+
+def _haiku_compressor(ratio):
     with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
         from agent.context_compressor import ContextCompressor
 
-        compressor = ContextCompressor(model=HAIKU, threshold_percent=0.08535, protect_first_n=0, protect_last_n=3, quiet_mode=True)
-    compressor.last_prompt_tokens = 90_000
-    compressor.last_real_prompt_tokens = 90_000
+        c = ContextCompressor(model=HAIKU, threshold_percent=0.08535, protect_first_n=0,
+                              protect_last_n=3, summary_target_ratio=0.10, quiet_mode=True)
+    c.native_token_ratio = ratio
+    return c
+
+
+def test_tail_and_summary_budgets_shrink_by_the_ratio_only_when_set():
+    stock = _haiku_compressor(0.0)
+    scaled = _haiku_compressor(1.76)
+    # 85,000 with a 4,096 output reservation, 85,350 without one.
+    assert 85_000 <= stock.threshold_tokens <= 85_350
+    tail = int(stock.threshold_tokens * 0.10)
+    assert stock._native_scaled(stock.tail_token_budget) == stock.tail_token_budget == tail
+    assert scaled._native_scaled(scaled.tail_token_budget) == int(tail / 1.76)
+    turns = [{"role": "user", "content": "x" * 400_000}]
+    assert stock._compute_summary_budget(turns) == stock.max_summary_tokens == 10_000
+    assert scaled._compute_summary_budget(turns) == int(10_000 / 1.76)
+
+
+def test_tail_cut_keeps_less_when_scaled():
+    msgs = [{"role": "system", "content": "s"}]
+    for i in range(40):
+        msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": "y" * 4_000})
+    stock = _haiku_compressor(0.0)._find_tail_cut_by_tokens(msgs, 1)
+    scaled = _haiku_compressor(1.76)._find_tail_cut_by_tokens(msgs, 1)
+    assert scaled > stock  # the tail starts later, so it is shorter
+
+
+def test_preflight_compacts_in_provider_units_for_listed_model():
+    from unittest.mock import MagicMock
+
+    compressor = _haiku_compressor(1.76)
     history = []
-    for i in range(10):
-        history.append({"role": "user", "content": f"short question {i}"})
-        history.append({"role": "assistant", "content": f"short answer {i}"})
+    # ~55k estimate: below 85k as chars/4, above it (~97k) in provider units.
+    for i in range(20):
+        history.append({"role": "user", "content": f"q{i} " + "z" * 5_500})
+        history.append({"role": "assistant", "content": f"a{i} " + "z" * 5_500})
 
     def run(models):
         agent = _agent(HAIKU, models)
         agent.compression_enabled = True
         agent.context_compressor = compressor
+        compressor.last_prompt_tokens = 0
         agent._compress_context = MagicMock(side_effect=lambda messages, *_a, **_k: (messages[-3:], "SYSTEM"))
         _build(agent, conversation_history=list(history), user_message="next")
         return agent._compress_context.call_count
 
-    assert run(()) == 0          # stock: the tiny estimate never reaches 85k
-    assert run((HAIKU,)) == 1    # listed: the 90k native reading does
+    assert run(()) == 0
+    assert run((HAIKU,)) == 1
