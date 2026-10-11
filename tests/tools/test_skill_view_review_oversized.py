@@ -107,3 +107,39 @@ def test_review_can_still_read_a_supporting_file_of_oversized_skill(isolate_skil
         result = json.loads(skill_view("big-skill", "references/notes.md"))
     assert result["success"] is True
     assert "small reference" in result["content"]
+
+
+@pytest.mark.parametrize("file_path", ["SKILL.md", "./SKILL.md"])
+def test_review_explicit_skill_md_file_path_gets_notice(isolate_skills, file_path):
+    """Review finding on #28: file_path pointing at SKILL.md must not bypass."""
+    from tools.skills_tool import skill_view
+    from tools.skill_manager_tool import _reset_background_review_read_marks
+
+    content = _place(isolate_skills, "big-skill", 69_286)
+    _reset_background_review_read_marks()
+    with _review():
+        raw = skill_view("big-skill", file_path)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "content" not in result
+        assert "size cap" in result["notice"]
+        patched = json.loads(skill_manage(
+            action="patch", name="big-skill",
+            old_string="# big-skill\n\n" + "x" * 1_000, new_string="# big-skill\n\n",
+        ))
+    assert patched["success"] is False
+    assert (isolate_skills / "big-skill" / "SKILL.md").read_text(encoding="utf-8") == content
+    _reset_background_review_read_marks()
+
+
+def test_review_notice_description_is_bounded(isolate_skills):
+    from tools.skills_tool import MAX_DESCRIPTION_LENGTH, skill_view
+
+    long_desc = "d" * 5_000
+    head = f"---\nname: long-desc\ndescription: {long_desc}\n---\n# long-desc\n\n"
+    (isolate_skills / "long-desc").mkdir()
+    (isolate_skills / "long-desc" / "SKILL.md").write_text(head + "x" * 30_000, encoding="utf-8")
+    with _review():
+        result = json.loads(skill_view("long-desc"))
+    assert "content" not in result
+    assert len(result["description"]) <= MAX_DESCRIPTION_LENGTH

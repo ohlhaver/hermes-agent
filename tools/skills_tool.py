@@ -1296,7 +1296,17 @@ def skill_view(
         # native tokens. The review gets only name and description; no read mark
         # is set, so the read-before-write guard also refuses any patch. Chat
         # turns and supporting files are unchanged.
-        if not file_path:
+        # An explicit file_path that resolves to SKILL.md itself counts too.
+        wants_skill_md = not file_path
+        if file_path and skill_dir:
+            try:
+                from tools.path_security import has_traversal_component
+
+                if not has_traversal_component(file_path):
+                    wants_skill_md = (skill_dir / file_path).resolve() == skill_md.resolve()
+            except Exception:
+                wants_skill_md = False
+        if wants_skill_md:
             from tools.skill_manager_tool import AGENT_SKILL_MD_MAX_CHARS
             from tools.skill_provenance import is_background_review
 
@@ -1308,7 +1318,9 @@ def skill_view(
                     {
                         "success": True,
                         "name": resolved_name,
-                        "description": str(parsed_frontmatter.get("description", "")),
+                        "description": str(parsed_frontmatter.get("description", ""))[
+                            :MAX_DESCRIPTION_LENGTH
+                        ],
                         "notice": (
                             f"This skill exceeds the size cap ({len(content):,} characters, "
                             f"limit {AGENT_SKILL_MD_MAX_CHARS:,}); it cannot be extended in "
