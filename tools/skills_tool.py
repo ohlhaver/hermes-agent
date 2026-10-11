@@ -1289,6 +1289,35 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        # HPD-1167 follow-up (r122 acceptance, fc-e2e-2): in the background
+        # review a SKILL.md above the agent cap is not returned. The cap refuses
+        # every review write that would grow it, yet the review still loaded the
+        # 69k-char hey-hermes-memory-stack in full and ran four calls above 100k
+        # native tokens. The review gets only name and description; no read mark
+        # is set, so the read-before-write guard also refuses any patch. Chat
+        # turns and supporting files are unchanged.
+        if not file_path:
+            from tools.skill_manager_tool import AGENT_SKILL_MD_MAX_CHARS
+            from tools.skill_provenance import is_background_review
+
+            if len(content) > AGENT_SKILL_MD_MAX_CHARS and is_background_review():
+                logger.info(
+                    "skill_review_skip_oversize name=%s chars=%d", resolved_name, len(content)
+                )
+                return json.dumps(
+                    {
+                        "success": True,
+                        "name": resolved_name,
+                        "description": str(parsed_frontmatter.get("description", "")),
+                        "notice": (
+                            f"This skill exceeds the size cap ({len(content):,} characters, "
+                            f"limit {AGENT_SKILL_MD_MAX_CHARS:,}); it cannot be extended in "
+                            "review, leave it."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
