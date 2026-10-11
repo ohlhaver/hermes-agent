@@ -233,14 +233,23 @@ def _store_native_ratio(model: str, ratio: float) -> None:
                 data = {}
         except Exception:
             data = {}
-        if data.get(model) is not None and abs(float(data.get(model)) - ratio) < 0.01:
+        # A malformed stored entry (not a number) is simply overwritten.
+        previous = _clamp_ratio(data.get(model))
+        if previous is not None and abs(previous - ratio) < 0.01:
             return
         data[model] = round(ratio, 4)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = _tempfile.mkstemp(dir=str(path.parent), prefix=".native_token_ratios.")
-        with _os.fdopen(fd, "w", encoding="utf-8") as handle:
-            _json.dump(data, handle, sort_keys=True)
-        _os.replace(tmp, path)
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as handle:
+                _json.dump(data, handle, sort_keys=True)
+            _os.replace(tmp, path)
+        except Exception:
+            try:
+                _os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         logger.debug("HPD-1151 native ratio store write failed", exc_info=True)
 
@@ -305,7 +314,8 @@ def trigger_pressure_tokens(agent: Any, rough_tokens: int) -> int:
     apply to the provider's own count, about 1.76x that estimate, so a
     threshold on the estimate fired far above the line. For a listed model
     the estimate is scaled into provider units by ``native_token_ratio``,
-    calibrated from the last answered request (seed 1.8). Because it scales
+    calibrated from the last answered request (seed: the ratio last stored
+    for the model, else 1.0). Because it scales
     the current message list, a sidecar dropped at turn start is not counted
     again. Unlisted models: the estimate, unchanged. The same pressure also
     feeds the Ollama context-limit check, which never applies to a listed

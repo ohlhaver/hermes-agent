@@ -76,3 +76,24 @@ def test_unlisted_model_neither_reads_nor_writes(home):
     assert tc.native_token_ratio(a) == 0.0
     tc.calibrate_native_token_ratio(a, 100_000, 117_000)
     assert not (home / "native_token_ratios.json").exists()
+
+
+def test_malformed_stored_entry_is_repaired_on_next_calibration(home):
+    (home / "native_token_ratios.json").write_text(json.dumps({DEEPSEEK: "abc", HAIKU: [1]}))
+    a = _Agent(DEEPSEEK)
+    assert tc.native_token_ratio(a) == 1.0
+    tc.calibrate_native_token_ratio(a, 100_000, 117_000)
+    stored = json.loads((home / "native_token_ratios.json").read_text())
+    assert stored[DEEPSEEK] == pytest.approx(1.17)
+
+
+def test_failed_write_leaves_no_temp_file(home, monkeypatch):
+    import json as _json
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_json, "dump", boom)
+    a = _Agent(DEEPSEEK)
+    tc.calibrate_native_token_ratio(a, 100_000, 117_000)  # must not raise
+    assert [p.name for p in home.iterdir() if p.name.startswith(".native_token_ratios.")] == []
