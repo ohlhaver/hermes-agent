@@ -640,6 +640,15 @@ def _validate_agent_skill_md_size(
         return None
     if previous is not None and len(content) <= len(previous):
         return None
+    if previous is not None and len(previous) > AGENT_SKILL_MD_MAX_CHARS:
+        return (
+            f"SKILL.md is already {len(previous):,} characters, above the "
+            f"{AGENT_SKILL_MD_MAX_CHARS:,} limit for SKILL.md written by the "
+            f"agent; it may shrink but may not grow (this change would make it "
+            f"{len(content):,}). Move detail into references/<topic>.md with "
+            f"skill_manage(action='write_file', file_path='references/<topic>.md', "
+            f"...) and replace it in SKILL.md with a one-line pointer."
+        )
     return (
         f"SKILL.md would be {len(content):,} characters "
         f"(limit for SKILL.md written by the agent: {AGENT_SKILL_MD_MAX_CHARS:,}). "
@@ -648,6 +657,14 @@ def _validate_agent_skill_md_size(
         f"file_path='references/<topic>.md', ...) and leave a one-line pointer "
         f"in SKILL.md."
     )
+
+
+def _is_root_skill_md(skill_dir: Path, target: Path) -> bool:
+    """True when ``target`` is the skill's own SKILL.md (HPD-1167)."""
+    try:
+        return target.resolve() == (skill_dir / "SKILL.md").resolve()
+    except Exception:
+        return target.name == "SKILL.md" and target.parent == skill_dir
 
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
@@ -1044,6 +1061,10 @@ def _patch_skill(
     if not target.exists():
         return {"success": False, "error": f"File not found: {target.relative_to(skill_dir)}"}
 
+    # HPD-1167: decide "this is SKILL.md" from the resolved target, so an
+    # explicit file_path="SKILL.md" gets the same cap and frontmatter checks.
+    is_skill_md = _is_root_skill_md(skill_dir, target)
+
     read_guard = _background_review_read_before_write_guard(
         name,
         target,
@@ -1086,7 +1107,7 @@ def _patch_skill(
         return {"success": False, "error": err}
 
     # If patching SKILL.md, validate frontmatter is still intact
-    if not file_path:
+    if is_skill_md:
         err = (
             _validate_agent_skill_md_size(new_content, previous=content)
             if agent_write else None
@@ -1261,6 +1282,16 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
     assert target is not None
+    # HPD-1167: SKILL.md is never replaced through write_file; edit and patch
+    # carry its frontmatter check and the agent size cap.
+    if _is_root_skill_md(existing["path"], target):
+        return {
+            "success": False,
+            "error": (
+                "write_file cannot replace SKILL.md. Use action='edit' for a full "
+                "rewrite or action='patch' for a targeted change."
+            ),
+        }
     if target.exists():
         read_guard = _background_review_read_before_write_guard(
             name, target, "write_file", file_path

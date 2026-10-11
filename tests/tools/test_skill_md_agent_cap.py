@@ -157,3 +157,51 @@ def test_dashboard_write_path_is_not_capped(isolate_skills):
     assert _create_skill("user-big", big)["success"] is True
     bigger = _content("user-big", 60_000)
     assert _edit_skill("user-big", bigger)["success"] is True
+
+
+def test_patch_with_explicit_skill_md_file_path_is_capped(isolate_skills):
+    """Review finding on #27: file_path='SKILL.md' must not bypass the cap."""
+    base = _content("explicit", 20_000)
+    assert json.loads(skill_manage(action="create", name="explicit", content=base))["success"]
+    result = json.loads(skill_manage(
+        action="patch", name="explicit", file_path="SKILL.md",
+        old_string="# explicit", new_string="# explicit\n" + ("y" * 30_000),
+    ))
+    assert result["success"] is False
+    assert "25,000" in result["error"]
+    assert (isolate_skills / "explicit" / "SKILL.md").read_text(encoding="utf-8") == base
+
+
+def test_patch_with_explicit_skill_md_file_path_keeps_frontmatter_check(isolate_skills):
+    base = _content("fm", 1_000)
+    assert json.loads(skill_manage(action="create", name="fm", content=base))["success"]
+    result = json.loads(skill_manage(
+        action="patch", name="fm", file_path="SKILL.md",
+        old_string="---\nname: fm", new_string="name: fm",
+    ))
+    assert result["success"] is False
+    assert (isolate_skills / "fm" / "SKILL.md").read_text(encoding="utf-8") == base
+
+
+def test_write_file_cannot_target_skill_md(isolate_skills):
+    """Review finding on #27: write_file must not replace SKILL.md (use edit)."""
+    base = _content("wf", 20_000)
+    assert json.loads(skill_manage(action="create", name="wf", content=base))["success"]
+    result = json.loads(skill_manage(
+        action="write_file", name="wf", file_path="SKILL.md",
+        file_content=_content("wf", 90_000),
+    ))
+    assert result["success"] is False
+    assert "edit" in result["error"]
+    assert (isolate_skills / "wf" / "SKILL.md").read_text(encoding="utf-8") == base
+
+
+def test_over_cap_error_names_current_size_for_existing_skill(isolate_skills):
+    _hand_place(isolate_skills, "legacy-big", 70_000)
+    result = json.loads(skill_manage(
+        action="patch", name="legacy-big",
+        old_string="# legacy-big", new_string="# legacy-big\n\nMore.",
+    ))
+    assert result["success"] is False
+    assert "70,000" in result["error"]
+    assert "may not grow" in result["error"]
