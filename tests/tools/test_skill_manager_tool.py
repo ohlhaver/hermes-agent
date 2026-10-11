@@ -2,6 +2,7 @@
 
 import json
 from contextlib import contextmanager
+from contextvars import copy_context
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1388,6 +1389,102 @@ class TestCuratorConsolidationDeleteGuard:
                 new_string="Step 1: Do the thing safely.",
             ))
             assert allowed["success"] is True, allowed
+
+        _reset_background_review_read_marks()
+
+    def test_background_review_read_survives_copied_tool_contexts(
+        self, tmp_path, monkeypatch
+    ):
+        """A view in one tool worker authorizes a patch in the next worker.
+
+        Backport of upstream 335c60ecdd; HPD-1167 (HPD-1151 diagnosis).
+        """
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_skill("reviewed", _skill_content("reviewed"))
+
+            viewed = copy_context().run(skill_view, "reviewed")
+            assert json.loads(viewed)["success"] is True
+
+            patched = copy_context().run(
+                skill_manage,
+                action="patch",
+                name="reviewed",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+            )
+            assert json.loads(patched)["success"] is True
+
+        _reset_background_review_read_marks()
+
+    def test_background_review_read_in_parallel_tool_worker_authorizes_patch(
+        self, tmp_path, monkeypatch
+    ):
+        """HPD-1167: the concurrent tool path (tool_executor) runs skill_view in a
+        DaemonThreadPoolExecutor worker wrapped by propagate_context_to_thread.
+        On fc-e2e-2 the mark set there was lost, the patch was refused, and the
+        review read a 70k-char skill a second time (> 100k native tokens)."""
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+        from tools.skills_tool import skill_view, skills_list
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.thread_context import propagate_context_to_thread
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_skill("reviewed", _skill_content("reviewed"))
+
+            executor = DaemonThreadPoolExecutor(max_workers=2)
+            try:
+                listed = executor.submit(propagate_context_to_thread(skills_list))
+                viewed = executor.submit(
+                    propagate_context_to_thread(skill_view), "reviewed"
+                )
+                assert json.loads(listed.result(timeout=30))["success"] is True
+                assert json.loads(viewed.result(timeout=30))["success"] is True
+            finally:
+                executor.shutdown(wait=True)
+
+            patched = json.loads(skill_manage(
+                action="patch",
+                name="reviewed",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+            ))
+            assert patched["success"] is True, patched
+
+        _reset_background_review_read_marks()
+
+    def test_background_review_read_marks_stay_isolated_between_reviews(
+        self, tmp_path, monkeypatch
+    ):
+        """Copied tool contexts share only their own review's read marks."""
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_skill("reviewed", _skill_content("reviewed"))
+
+            first_review = copy_context()
+            _reset_background_review_read_marks()
+            second_review = copy_context()
+
+            viewed = first_review.run(skill_view, "reviewed")
+            assert json.loads(viewed)["success"] is True
+
+            blocked = second_review.run(
+                skill_manage,
+                action="patch",
+                name="reviewed",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the thing safely.",
+            )
+            result = json.loads(blocked)
+            assert result["success"] is False
+            assert result.get("_read_before_write_required") is True
 
         _reset_background_review_read_marks()
 
