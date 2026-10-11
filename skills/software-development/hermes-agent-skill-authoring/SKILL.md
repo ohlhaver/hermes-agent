@@ -58,7 +58,7 @@ metadata:
 ## Size Limits
 
 - Description: ≤ 1024 chars (enforced).
-- Full SKILL.md: ≤ 100,000 chars (enforced as `MAX_SKILL_CONTENT_CHARS`, ~36k tokens).
+- SKILL.md written through `skill_manage`: ≤ 25,000 chars (enforced as `AGENT_SKILL_MD_MAX_CHARS`, ~9k tokens); an existing larger SKILL.md may shrink but not grow. Supporting files and dashboard edits keep the general limit of 100,000 chars (`MAX_SKILL_CONTENT_CHARS`).
 - Peer skills in `software-development/` sit at **8-14k chars**. Aim for that range. If you're pushing past 20k, split into `references/*.md` and reference them from SKILL.md.
 
 ## Writing Quality Principles

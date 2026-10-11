@@ -2,6 +2,8 @@
 
 Agent writes (create/edit/patch/write_file) are constrained to
 MAX_SKILL_CONTENT_CHARS (100k) and MAX_SKILL_FILE_BYTES (1 MiB).
+SKILL.md itself is further capped at AGENT_SKILL_MD_MAX_CHARS (HPD-1167,
+see tests/tools/test_skill_md_agent_cap.py).
 Hand-placed and hub-installed skills have no hard limit.
 """
 
@@ -10,6 +12,7 @@ import json
 import pytest
 
 from tools.skill_manager_tool import (
+    AGENT_SKILL_MD_MAX_CHARS,
     MAX_SKILL_CONTENT_CHARS,
     _validate_content_size,
     skill_manage,
@@ -74,11 +77,12 @@ class TestCreateSkillSizeLimit:
         assert "100,000" in result["error"]
 
     def test_create_at_limit(self, isolate_skills):
-        # Content at exactly the limit should succeed
+        # Content at exactly the SKILL.md limit should succeed. Since HPD-1167
+        # that limit is the lower agent cap, not MAX_SKILL_CONTENT_CHARS.
         frontmatter = "---\nname: edge-skill\ndescription: Edge case\n---\n# Edge\n\n"
-        body_budget = MAX_SKILL_CONTENT_CHARS - len(frontmatter)
+        body_budget = AGENT_SKILL_MD_MAX_CHARS - len(frontmatter)
         content = frontmatter + ("x" * body_budget)
-        assert len(content) == MAX_SKILL_CONTENT_CHARS
+        assert len(content) == AGENT_SKILL_MD_MAX_CHARS
         result = json.loads(skill_manage(action="create", name="edge-skill", content=content))
         assert result["success"] is True
 
@@ -103,10 +107,14 @@ class TestEditSkillSizeLimit:
 class TestPatchSkillSizeLimit:
     """patch action checks resulting size, not just the new_string."""
 
-    def test_patch_that_would_exceed_limit(self, isolate_skills):
-        # Create a skill near the limit
+    def test_patch_that_would_exceed_limit(self, isolate_skills, tmp_path):
+        # A hand-placed skill near the general limit (the agent cap of
+        # HPD-1167 forbids creating one this large through skill_manage).
+        skill_dir = tmp_path / "skills" / "near-limit"
+        skill_dir.mkdir(parents=True)
         near_limit = _make_skill_content(MAX_SKILL_CONTENT_CHARS - 50)
-        json.loads(skill_manage(action="create", name="near-limit", content=near_limit))
+        near_limit = near_limit.replace("name: test-skill", "name: near-limit")
+        (skill_dir / "SKILL.md").write_text(near_limit, encoding="utf-8")
 
         # Patch that adds enough to go over
         result = json.loads(skill_manage(

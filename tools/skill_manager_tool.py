@@ -506,6 +506,18 @@ def _curator_consolidation_delete_guard(
 
 
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
+# HPD-1167 (HPD-1151 diagnosis, fc-e2e-2, 2026-10-11): the background skill
+# review patches the same agent-created skill on every pass and loads its full
+# SKILL.md each time (skill_view, read-before-write guard). One test skill grew
+# from 62k to 72k chars within half an hour and pushed review calls above 100k
+# native tokens; under the 100k general limit it could keep growing to ~36k
+# tokens per read. SKILL.md written through skill_manage is therefore capped
+# lower; further detail belongs in references/<topic>.md (write_file keeps the
+# general limit). A SKILL.md already above the cap is not touched here; its next
+# create/edit/patch may keep or shrink its size but never grow it. Only writes
+# through the agent's skill_manage tool are capped (agent_write=True); the
+# dashboard editor (hermes_cli/web_server.py) is the user writing directly.
+AGENT_SKILL_MD_MAX_CHARS = 25_000   # ~9k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
@@ -613,6 +625,29 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
             f"in references/ or templates/."
         )
     return None
+
+
+def _validate_agent_skill_md_size(
+    content: str, previous: Optional[str] = None
+) -> Optional[str]:
+    """HPD-1167: cap SKILL.md written by the agent at AGENT_SKILL_MD_MAX_CHARS.
+
+    ``previous`` is the current SKILL.md of an existing skill. A skill already
+    above the cap may be rewritten or patched as long as the result does not
+    grow, so it can be split into references/ at its next edit.
+    """
+    if len(content) <= AGENT_SKILL_MD_MAX_CHARS:
+        return None
+    if previous is not None and len(content) <= len(previous):
+        return None
+    return (
+        f"SKILL.md would be {len(content):,} characters "
+        f"(limit for SKILL.md written by the agent: {AGENT_SKILL_MD_MAX_CHARS:,}). "
+        f"Keep SKILL.md a short overview: move detail into "
+        f"references/<topic>.md with skill_manage(action='write_file', "
+        f"file_path='references/<topic>.md', ...) and leave a one-line pointer "
+        f"in SKILL.md."
+    )
 
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
@@ -830,7 +865,9 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
 # Core actions
 # =============================================================================
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+def _create_skill(
+    name: str, content: str, category: str = None, *, agent_write: bool = False
+) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
     err = _validate_name(name)
@@ -847,6 +884,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         return {"success": False, "error": err}
 
     err = _validate_content_size(content)
+    if err:
+        return {"success": False, "error": err}
+
+    err = _validate_agent_skill_md_size(content) if agent_write else None
     if err:
         return {"success": False, "error": err}
 
@@ -898,7 +939,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     return result
 
 
-def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+def _edit_skill(name: str, content: str, *, agent_write: bool = False) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     err = _validate_frontmatter(content)
     if err:
@@ -924,6 +965,14 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+
+    err = (
+        _validate_agent_skill_md_size(content, previous=original_content)
+        if agent_write else None
+    )
+    if err:
+        return {"success": False, "error": err}
+
     _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
@@ -957,6 +1006,8 @@ def _patch_skill(
     new_string: str,
     file_path: str = None,
     replace_all: bool = False,
+    *,
+    agent_write: bool = False,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
 
@@ -1036,6 +1087,12 @@ def _patch_skill(
 
     # If patching SKILL.md, validate frontmatter is still intact
     if not file_path:
+        err = (
+            _validate_agent_skill_md_size(new_content, previous=content)
+            if agent_write else None
+        )
+        if err:
+            return {"success": False, "error": err}
         err = _validate_frontmatter(new_content)
         if err:
             return {
@@ -1394,19 +1451,21 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+        result = _create_skill(name, content, category, agent_write=True)
 
     elif action == "edit":
         if not content:
             return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        result = _edit_skill(name, content, agent_write=True)
 
     elif action == "patch":
         if not old_string:
             return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
         if new_string is None:
             return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        result = _patch_skill(
+            name, old_string, new_string, file_path, replace_all, agent_write=True
+        )
 
     elif action == "delete":
         result = _delete_skill(name, absorbed_into=absorbed_into)
