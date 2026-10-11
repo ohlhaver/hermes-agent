@@ -21,6 +21,13 @@ SIDECAR = "older question\n\n" + ("recalled memory context " * 400)
 
 
 @pytest.fixture(autouse=True)
+def _isolated_ratio_store(tmp_path, monkeypatch):
+    from agent import turn_context as _tc
+
+    monkeypatch.setattr(_tc, "_native_ratio_store_path", lambda: tmp_path / "native_token_ratios.json")
+
+
+@pytest.fixture(autouse=True)
 def _stub_runtime_main():
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
         yield
@@ -109,7 +116,8 @@ def test_config_parsing(value, expected):
 # chars/4 units. Claude Haiku 5.5's provider count, which the price and the
 # 100k long-price line use, was 1.76x that on fc-e2e-2 (estimate 84,184,
 # provider 148,151). For the listed models the estimate is scaled by a ratio
-# calibrated from the last answered request (seed 1.8), and the tail and
+# calibrated from the last answered request (seed: the last ratio stored for
+# the model, else 1.0), and the tail and
 # summary budgets are divided by it.
 
 from agent.turn_context import (  # noqa: E402
@@ -139,7 +147,7 @@ def test_unlisted_or_default_is_the_bare_estimate():
 
 def test_listed_model_uses_seed_then_calibrated_ratio():
     agent = _ratio_agent(HAIKU, (HAIKU,))
-    assert trigger_pressure_tokens(agent, 50_000) == 90_000          # seed 1.8
+    assert trigger_pressure_tokens(agent, 50_000) == 50_000          # unmeasured model: seed 1.0
     calibrate_native_token_ratio(agent, 84_184, 148_151)            # fc-e2e-2 measurement
     assert round(agent.context_compressor.native_token_ratio, 2) == 1.76
     assert trigger_pressure_tokens(agent, 50_000) == int(50_000 * 148_151 / 84_184)
@@ -229,8 +237,9 @@ def test_turn_start_seeds_the_compressor_so_depth_matches_the_trigger():
     agent = _agent(HAIKU, (HAIKU,))
     agent.context_compressor = compressor
     _build(agent, conversation_history=[{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}])
-    assert compressor.native_token_ratio == 1.8
-    assert compressor._native_scaled(compressor.tail_token_budget) == int(compressor.tail_token_budget / 1.8)
+    # Unmeasured model: seed 1.0 (no scaling); a stored ratio would be used instead.
+    assert compressor.native_token_ratio == 1.0
+    assert compressor._native_scaled(compressor.tail_token_budget) == compressor.tail_token_budget
 
 
 def test_turn_start_does_not_seed_unlisted_models():

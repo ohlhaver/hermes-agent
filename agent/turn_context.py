@@ -180,20 +180,79 @@ def drop_replayed_user_sidecars(
     return dropped
 
 
-# HPD-1151: the provider's (native) prompt count for Claude Haiku 5.5 is about
-# 1.76x Hermes' chars/4 estimate. Measured on fc-e2e-2, 2026-10-10 20:30Z,
-# request composition (HPD-1127) id 13984e34: estimate 84,184 tokens
-# (336,739 chars), provider 148,151. 1.8 is the seed until the first response
-# of the agent calibrates it; the calibrated value is clamped to this range.
-_NATIVE_RATIO_SEED = 1.8
+# HPD-1151: the provider's (native) prompt count differs per model from
+# Hermes' chars/4 estimate -- about 1.76x for Claude Haiku 5.5 (fc-e2e-2,
+# 2026-10-10, estimate 84,184 vs provider 148,151) and about 1.17x for
+# DeepSeek V4 Flash (fc-e2e-2, 2026-10-11). A fixed 1.8 seed made a freshly
+# restarted DeepSeek agent compact at ~78k native instead of 85k. The seed is
+# therefore the last ratio measured for the same model, kept in a small file
+# under HERMES_HOME so it survives a gateway restart; a model never measured
+# starts at 1.0 (stock Hermes counting) and calibrates on its first answered
+# request. Every value is clamped to this range.
+_NATIVE_RATIO_SEED = 1.0
 _NATIVE_RATIO_MIN = 1.0
 _NATIVE_RATIO_MAX = 3.0
+_NATIVE_RATIO_STORE = "native_token_ratios.json"
+
+
+def _native_ratio_store_path():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / _NATIVE_RATIO_STORE
+
+
+def _clamp_ratio(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return max(_NATIVE_RATIO_MIN, min(_NATIVE_RATIO_MAX, float(value)))
+
+
+def _stored_native_ratio(model: str) -> Optional[float]:
+    try:
+        import json as _json
+
+        data = _json.loads(_native_ratio_store_path().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _clamp_ratio(data.get(model))
+
+
+def _store_native_ratio(model: str, ratio: float) -> None:
+    """Best effort, atomic replace; a failure only costs the next restart its seed."""
+    try:
+        import json as _json
+        import os as _os
+        import tempfile as _tempfile
+
+        path = _native_ratio_store_path()
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        if data.get(model) is not None and abs(float(data.get(model)) - ratio) < 0.01:
+            return
+        data[model] = round(ratio, 4)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tempfile.mkstemp(dir=str(path.parent), prefix=".native_token_ratios.")
+        with _os.fdopen(fd, "w", encoding="utf-8") as handle:
+            _json.dump(data, handle, sort_keys=True)
+        _os.replace(tmp, path)
+    except Exception:
+        logger.debug("HPD-1151 native ratio store write failed", exc_info=True)
 
 
 def _listed_for_native_count(agent: Any) -> bool:
     models = getattr(agent, "_current_turn_sidecar_models", None) or ()
     model = str(getattr(agent, "model", "") or "").strip().lower()
     return bool(model) and model in models
+
+
+def _agent_model(agent: Any) -> str:
+    return str(getattr(agent, "model", "") or "").strip().lower()
 
 
 def native_token_ratio(agent: Any) -> float:
@@ -209,12 +268,13 @@ def native_token_ratio(agent: Any) -> float:
     ratio = getattr(compressor, "native_token_ratio", 0.0)
     if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and ratio > 0:
         return float(ratio)
+    seed = _stored_native_ratio(_agent_model(agent)) or _NATIVE_RATIO_SEED
     if compressor is not None:
         try:
-            compressor.native_token_ratio = _NATIVE_RATIO_SEED
+            compressor.native_token_ratio = seed
         except Exception:
             pass
-    return _NATIVE_RATIO_SEED
+    return seed
 
 
 def calibrate_native_token_ratio(agent: Any, rough_request_tokens: int, provider_prompt_tokens: int) -> None:
@@ -233,6 +293,7 @@ def calibrate_native_token_ratio(agent: Any, rough_request_tokens: int, provider
             compressor.native_token_ratio = ratio
         except Exception:
             pass
+    _store_native_ratio(_agent_model(agent), ratio)
 
 
 def trigger_pressure_tokens(agent: Any, rough_tokens: int) -> int:
