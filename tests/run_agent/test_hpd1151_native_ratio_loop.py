@@ -2,9 +2,18 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from tests.run_agent.test_413_compression import _mock_response, agent  # noqa: F401  (fixture)
 
 HAIKU = "anthropic/claude-haiku-5.5"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ratio_store(tmp_path, monkeypatch):
+    from agent import turn_context as _tc
+
+    monkeypatch.setattr(_tc, "_native_ratio_store_path", lambda: tmp_path / "native_token_ratios.json")
 
 
 def _run(agent, models, prompt_tokens):  # noqa: F811
@@ -26,7 +35,7 @@ def _run(agent, models, prompt_tokens):  # noqa: F811
 
 def test_listed_model_calibrates_from_its_response(agent):  # noqa: F811
     _run(agent, (HAIKU,), 0)  # a response without usage leaves the turn-start seed
-    assert agent.context_compressor.native_token_ratio == 1.8
+    assert agent.context_compressor.native_token_ratio == 1.0
     _run(agent, (HAIKU,), 1)
     rough = agent._hpd1151_rough_request_tokens
     assert rough > 0
