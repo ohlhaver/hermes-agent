@@ -284,3 +284,40 @@ def test_iteration_limit_summary_refusal_sends_nothing(seen):
     assert not client.chat.completions.create.called
     assert not anthropic_send.called
     assert not codex_send.called
+
+
+def test_refused_summary_keeps_a_configured_summary_model_and_is_asked_once(seen):
+    """A refusal is not a provider fault: no retry on the main model, no lost summary model."""
+    from agent.context_compressor import ContextCompressor
+
+    cc = ContextCompressor(
+        model="claude-haiku", threshold_percent=0.5, protect_first_n=1, protect_last_n=2,
+        quiet_mode=True, config_context_length=64000, provider="anthropic",
+        summary_model_override="claude-sonnet",
+    )
+    messages = [{"role": "system", "content": "sys"}]
+    for i in range(12):
+        messages.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i} " + "x" * 400})
+    primary = _client("https://api.anthropic.com")
+    with patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "claude-sonnet")), \
+         patch("agent.auxiliary_client._resolve_task_provider_model",
+               return_value=("anthropic", "claude-sonnet", None, None, None)):
+        result = cc.compress(messages, current_tokens=60000, force=True)
+    assert result == messages
+    assert len(seen) == 1
+    assert cc.summary_model == "claude-sonnet"
+    assert cc._last_summary_send_refused is True
+    assert cc._last_summary_error == "Nothing was sent."
+
+
+def test_iteration_limit_summary_refuses_an_amendment_the_wire_cannot_carry(seen):
+    """On a Codex wire there is no extra_body; a required amendment means refuse, not send without it."""
+    from agent.chat_completion_helpers import handle_max_iterations
+
+    agent = _max_iter_agent("https://openrouter.ai/api/v1")
+    agent.api_mode = "codex_responses"
+    with patch.object(agent, "_run_codex_stream") as codex_send, \
+         patch.object(agent, "_build_api_kwargs", return_value={"input": []}):
+        out = handle_max_iterations(agent, [{"role": "user", "content": "q"}], 5)
+    assert not codex_send.called
+    assert "cannot carry" in out

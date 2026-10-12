@@ -1085,7 +1085,11 @@ def compress_context(
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
-                if getattr(agent, "_last_compression_summary_warning", None) != _err:
+                # A send-guard refusal is the policy's own answer, and the turn
+                # that follows carries it to the user; "run /compress to retry"
+                # would be wrong advice.
+                _refused = bool(getattr(agent.context_compressor, "_last_summary_send_refused", False))
+                if not _refused and getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
                     agent._emit_warning(
                         f"⚠ Compression aborted: {_err}. "

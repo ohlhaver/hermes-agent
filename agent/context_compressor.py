@@ -25,6 +25,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_send_guard import AuxiliarySendRefused
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
@@ -2486,6 +2487,24 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_network_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
+            # A registered send guard refused the summary request before it
+            # left (agent/auxiliary_send_guard.py). That is a policy decision
+            # about this conversation on this route, not a provider fault:
+            # retrying on the main model would only be refused again and would
+            # drop the configured summary model for the agent's lifetime. Keep
+            # the conversation unchanged (the access-failure abort in
+            # compress()), and pause automatic attempts like any failure; a
+            # route change clears the pause (update_model).
+            if isinstance(e, AuxiliarySendRefused):
+                self._last_summary_auth_failure = True
+                self._last_summary_send_refused = True
+                self._record_compression_failure_cooldown(60, "summary request refused by a send guard")
+                self._last_summary_error = e.user_message
+                logger.warning(
+                    "Context compression: summary request refused by a send guard (%s); "
+                    "conversation kept unchanged.", e.reason or "refused",
+                )
+                return None
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
             #      a permanent misconfiguration, long cooldown is correct.
@@ -3443,6 +3462,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
+        self._last_summary_send_refused = False
         self._last_compression_made_progress = False
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by

@@ -2036,7 +2036,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            _guard_send(request={"model": agent.model, "messages": api_messages}, **_summary_guard)
+            _codex_request = {"model": agent.model, "messages": api_messages}
+            if _guard_send(request=_codex_request, **_summary_guard) is not _codex_request:
+                # This wire cannot carry an amended request (no extra_body).
+                from agent.auxiliary_send_guard import AuxiliarySendRefused as _Refused
+                raise _Refused("A send guard amended a request this route cannot carry.",
+                               reason="amendment_not_carried")
             if failure_halt:
                 from agent.codex_runtime import run_codex_stream
                 summary_response = run_codex_stream(
@@ -2107,6 +2112,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure
                         {"id": "pareto-router", "min_coding_score": _ps}
                     ]
 
+            _pre_guard_extra_body = dict(summary_extra_body)
             _guarded_summary = _guard_send(
                 request={"model": agent.model, "messages": api_messages, "extra_body": dict(summary_extra_body)},
                 **_summary_guard,
@@ -2117,6 +2123,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure
                 summary_kwargs["extra_body"] = summary_extra_body
 
             if agent.api_mode == "anthropic_messages":
+                if (_guarded_summary.get("extra_body") or {}) != _pre_guard_extra_body:
+                    # The Anthropic wire does not carry extra_body; an
+                    # amendment the guard required would be lost.
+                    from agent.auxiliary_send_guard import AuxiliarySendRefused as _Refused
+                    raise _Refused("A send guard amended a request this route cannot carry.",
+                                   reason="amendment_not_carried")
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
