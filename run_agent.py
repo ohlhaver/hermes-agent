@@ -6138,12 +6138,17 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
+        from agent.auxiliary_send_guard import auxiliary_session_scope
         from agent.conversation_compression import compress_context
-        return compress_context(
-            self, messages, system_message,
-            approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
-            force=force,
-        )
+        # Compression also runs outside a turn (gateway session hygiene,
+        # /compress), where no accounting context names the session; the
+        # summary request is guarded as this session's request either way.
+        with auxiliary_session_scope(getattr(self, "session_id", None)):
+            return compress_context(
+                self, messages, system_message,
+                approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+                force=force,
+            )
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
