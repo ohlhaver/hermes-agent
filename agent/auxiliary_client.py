@@ -104,6 +104,7 @@ class _OpenAIProxy:
 
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
+from agent.auxiliary_send_guard import AuxiliarySendRefused, guard_auxiliary_send  # noqa: F401 -- re-exported
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
@@ -3626,6 +3627,9 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    retry_kwargs = guard_auxiliary_send(
+        task=task, provider=resolved_provider, model=retry_model or final_model,
+        request=retry_kwargs, client=retry_client, base_url=resolved_base_url)
     return _validate_llm_response(
         retry_client.chat.completions.create(**retry_kwargs), task,
     )
@@ -3685,6 +3689,9 @@ async def _retry_same_provider_async(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    retry_kwargs = guard_auxiliary_send(
+        task=task, provider=resolved_provider, model=retry_model or final_model,
+        request=retry_kwargs, client=retry_client, base_url=resolved_base_url)
     return _validate_llm_response(
         await retry_client.chat.completions.create(**retry_kwargs), task,
     )
@@ -3871,6 +3878,11 @@ def _call_fallback_candidate_sync(
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base)
+    # A fallback is another route: it is guarded on its own, and a refusal
+    # propagates instead of moving on to the next candidate.
+    fb_kwargs = guard_auxiliary_send(
+        task=task, provider=fb_label, model=fb_model, request=fb_kwargs,
+        client=fb_client, base_url=fb_base)
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
@@ -3888,6 +3900,9 @@ def _call_fallback_candidate_sync(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                retry_kwargs = guard_auxiliary_send(
+                    task=task, provider=fb_provider, model=retry_model or fb_model,
+                    request=retry_kwargs, client=retry_client, base_url=fb_base)
                 try:
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
@@ -3937,6 +3952,11 @@ async def _call_fallback_candidate_async(
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base)
+    # A fallback is another route: it is guarded on its own, and a refusal
+    # propagates instead of moving on to the next candidate.
+    fb_kwargs = guard_auxiliary_send(
+        task=task, provider=fb_label, model=fb_model, request=fb_kwargs,
+        client=fb_client, base_url=fb_base)
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
@@ -3955,6 +3975,9 @@ async def _call_fallback_candidate_async(
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                retry_kwargs = guard_auxiliary_send(
+                    task=task, provider=fb_provider, model=retry_model or fb_model,
+                    request=retry_kwargs, client=retry_client, base_url=fb_base)
                 try:
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
@@ -7078,6 +7101,15 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # Registered send guards see the request on the route it is about to take,
+    # before anything leaves (agent/auxiliary_send_guard.py). Outside the try
+    # below on purpose: a refusal is not a provider failure and must not walk
+    # the fallback chain. Retries on the same client reuse these kwargs; every
+    # rebuilt or fallback request is guarded where it is built.
+    kwargs = guard_auxiliary_send(
+        task=task, provider=resolved_provider, model=final_model, request=kwargs,
+        client=client, base_url=resolved_base_url)
+
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
     # _validate_llm_response and the temperature/max_tokens/payment fallback chain
@@ -7692,6 +7724,11 @@ async def async_call_llm(
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    # See call_llm(): guarded before the try, so a refusal never falls back.
+    kwargs = guard_auxiliary_send(
+        task=task, provider=resolved_provider, model=final_model, request=kwargs,
+        client=client, base_url=resolved_base_url)
 
     try:
         # Retry ONCE on the same provider for a transient transport blip

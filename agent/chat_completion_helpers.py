@@ -2021,9 +2021,27 @@ def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure
             from agent.portal_tags import nous_portal_tags as _portal_tags
             summary_extra_body["tags"] = _portal_tags()
 
+        # This summary sends the whole conversation on the agent's own route
+        # without the main loop's middleware, so it goes through the same send
+        # guards as every auxiliary request (agent/auxiliary_send_guard.py).
+        from agent.auxiliary_send_guard import guard_auxiliary_send as _guard_send
+        _summary_guard = {
+            "task": "iteration_limit_summary",
+            "provider": agent.provider,
+            "model": agent.model,
+            "base_url": agent.base_url,
+            "session_id": getattr(agent, "session_id", None),
+        }
+
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
+            _codex_request = {"model": agent.model, "messages": api_messages}
+            if _guard_send(request=_codex_request, **_summary_guard) is not _codex_request:
+                # This wire cannot carry an amended request (no extra_body).
+                from agent.auxiliary_send_guard import AuxiliarySendRefused as _Refused
+                raise _Refused("A send guard amended a request this route cannot carry.",
+                               reason="amendment_not_carried")
             if failure_halt:
                 from agent.codex_runtime import run_codex_stream
                 summary_response = run_codex_stream(
@@ -2094,10 +2112,23 @@ def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure
                         {"id": "pareto-router", "min_coding_score": _ps}
                     ]
 
+            _pre_guard_extra_body = dict(summary_extra_body)
+            _guarded_summary = _guard_send(
+                request={"model": agent.model, "messages": api_messages, "extra_body": dict(summary_extra_body)},
+                **_summary_guard,
+            )
+            if isinstance(_guarded_summary.get("extra_body"), dict):
+                summary_extra_body = dict(_guarded_summary["extra_body"])
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
 
             if agent.api_mode == "anthropic_messages":
+                if (_guarded_summary.get("extra_body") or {}) != _pre_guard_extra_body:
+                    # The Anthropic wire does not carry extra_body; an
+                    # amendment the guard required would be lost.
+                    from agent.auxiliary_send_guard import AuxiliarySendRefused as _Refused
+                    raise _Refused("A send guard amended a request this route cannot carry.",
+                                   reason="amendment_not_carried")
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(model=agent.model, messages=api_messages, tools=None,
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
@@ -2167,8 +2198,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int, *, failure
                 final_response = failure_fallback if failure_halt else "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
+        from agent.auxiliary_send_guard import AuxiliarySendRefused as _SendRefused
         logger.warning(f"Failed to get summary response: {e}")
-        final_response = failure_fallback if failure_halt else f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        if isinstance(e, _SendRefused):
+            # The guard's own sentence is meant for the user; nothing was sent.
+            final_response = e.user_message
+        else:
+            final_response = failure_fallback if failure_halt else f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
 
     return final_response
 
