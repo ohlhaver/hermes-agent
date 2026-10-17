@@ -972,6 +972,7 @@ def _build_gateway_agent_history(
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
     )
+    from agent.context_compressor import ContextCompressor as _Compressor
 
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
@@ -993,7 +994,19 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
-        if inject_timestamps and role == "user" and isinstance(content, str):
+        # A stored compaction summary is a user-role row but no user turn.
+        # Stamping it would hide SUMMARY_PREFIX behind the timestamp, and the
+        # startswith-based summary checks (last-real-user anchor, auto-focus,
+        # carry-forward) would then count it as a real user turn (HPD-1282,
+        # r138 canary). Upstream skips compaction scaffolding the same way
+        # (``not is_compaction_scaffolding(msg)``); this fork does not persist
+        # the summary flag, so Hermes' own flag-or-content helper decides.
+        if (
+            inject_timestamps
+            and role == "user"
+            and isinstance(content, str)
+            and not _Compressor._is_context_summary_message(msg)
+        ):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
