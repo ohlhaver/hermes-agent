@@ -971,8 +971,12 @@ def _build_gateway_agent_history(
     from hermes_time import get_timezone as _get_msg_tz
     from gateway.message_timestamps import (
         render_user_content_with_timestamp as _render_msg_ts,
+        strip_leading_message_timestamps as _strip_msg_ts,
     )
-    from agent.context_compressor import ContextCompressor as _Compressor
+    from agent.context_compressor import (
+        ContextCompressor as _Compressor,
+        _MERGED_SUMMARY_DELIMITER,
+    )
 
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
@@ -1000,14 +1004,21 @@ def _build_gateway_agent_history(
         # carry-forward) would then count it as a real user turn (HPD-1282,
         # r138 canary). Upstream skips compaction scaffolding the same way
         # (``not is_compaction_scaffolding(msg)``); this fork does not persist
-        # the summary flag, so Hermes' own flag-or-content helper decides.
-        if (
-            inject_timestamps
-            and role == "user"
-            and isinstance(content, str)
-            and not _Compressor._is_context_summary_message(msg)
-        ):
-            content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
+        # the summary flag, so the flag or a summary prefix at the start of
+        # the row decides. Leading stamps are stripped first, so a summary
+        # that was persisted stamped while r138 ran heals on replay. A merged
+        # row starts with real user text and keeps its stamp; the summary
+        # after the merge delimiter is recognised there.
+        if role == "user" and isinstance(content, str):
+            _unstamped = _strip_msg_ts(content, tz=_msg_tz)[0]
+            if _Compressor._has_compressed_summary_metadata(msg) or (
+                isinstance(_unstamped, str)
+                and _MERGED_SUMMARY_DELIMITER not in _unstamped
+                and _Compressor._is_context_summary_content(_unstamped)
+            ):
+                content = _unstamped
+            elif inject_timestamps:
+                content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
             continue
