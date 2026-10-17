@@ -4780,6 +4780,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             pending_slot[session_key] = queued_event
 
+    async def _resolve_leftover_steer(
+        self,
+        adapter: Any,
+        session_key: Optional[str],
+        result: Optional[dict],
+        pending: Optional[str],
+        pending_event: Optional["MessageEvent"],
+    ) -> Optional[str]:
+        """Decide what happens to a /steer the agent could not inject.
+
+        Default: the leftover becomes the next user turn when nothing else is
+        pending, so it is not silently dropped.
+
+        An adapter that admits turns itself (one event at a time, each with
+        its own identity and accounting) can opt out by setting
+        ``leftover_steer_as_next_turn = False`` and implementing
+        ``on_leftover_steer(session_key, text)`` (sync or async). The gateway
+        then hands the text to that hook and starts no turn for it; the
+        adapter decides how the text is delivered. The hook also receives the
+        leftover when another pending text exists, a case the default path
+        drops. An opted-out adapter without the hook keeps the default so the
+        text is never lost.
+        """
+        if not result:
+            return pending
+        leftover = result.get("pending_steer")
+        if not leftover:
+            return pending
+        if adapter is not None and getattr(adapter, "leftover_steer_as_next_turn", True) is False:
+            handler = getattr(adapter, "on_leftover_steer", None)
+            if callable(handler):
+                try:
+                    outcome = handler(session_key, leftover)
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                    logger.debug(
+                        "Handed leftover /steer back to adapter for session %s",
+                        session_key or "?",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "on_leftover_steer failed for session %s: %s",
+                        session_key or "?",
+                        exc,
+                    )
+                return pending
+        if not pending and not pending_event:
+            logger.debug("Delivering leftover /steer as next turn: '%s...'", leftover[:40])
+            return leftover
+        return pending
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -21938,12 +21989,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Leftover /steer: if a steer arrived after the last tool batch
             # (e.g. during the final API call), the agent couldn't inject it
             # and returned it in result["pending_steer"]. Deliver it as the
-            # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
-                _leftover_steer = result.get("pending_steer")
-                if _leftover_steer:
-                    pending = _leftover_steer
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+            # next user turn so it isn't silently dropped -- unless the
+            # adapter asked to receive it instead (see the helper).
+            pending = await self._resolve_leftover_steer(
+                adapter, session_key, result, pending, pending_event
+            )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
