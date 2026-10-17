@@ -135,3 +135,91 @@ def test_build_history_injects_only_when_enabled():
     assert agent_history[0]["content"].endswith("hello")
     # Assistant message is never timestamped.
     assert agent_history[1]["content"] == "hi"
+
+
+def test_build_history_never_stamps_a_stored_compaction_summary():
+    """HPD-1282: a stored compaction summary is a user-role row. Stamping it
+    hides SUMMARY_PREFIX behind ``[Sat ...]`` and every startswith-based
+    summary check (anchor, auto-focus, carry-forward) then counts it as a real
+    user turn. Upstream skips compaction scaffolding the same way."""
+    from agent.context_compressor import SUMMARY_PREFIX, ContextCompressor
+    from gateway.run import _build_gateway_agent_history
+
+    summary = f"{SUMMARY_PREFIX}\n## Active Task\nweather question"
+    history = [
+        {"role": "user", "content": summary, "timestamp": _epoch(2026, 10, 17, 10, 37, 36)},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "Wie ist das Wetter heute?", "timestamp": _epoch(2026, 10, 17, 10, 58, 25)},
+    ]
+
+    agent_history, _ = _build_gateway_agent_history(history, inject_timestamps=True)
+
+    summaries = [
+        m for m in agent_history
+        if ContextCompressor._is_context_summary_message(m)
+    ]
+    assert len(summaries) == 1
+    assert agent_history[0]["content"] == summary
+    # Ordinary user rows keep their single prefix.
+    stamped = agent_history[2]["content"]
+    assert stamped.startswith("[Sat 2026-10-17 ")
+    assert strip_leading_message_timestamps(stamped)[0] == "Wie ist das Wetter heute?"
+
+
+def test_build_history_never_stamps_a_flagged_summary():
+    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "flagged body", COMPRESSED_SUMMARY_METADATA_KEY: True,
+         "timestamp": _epoch(2026, 10, 17, 10, 38, 0)},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    agent_history, _ = _build_gateway_agent_history(history, inject_timestamps=True)
+
+    assert agent_history[0]["content"] == "flagged body"
+
+
+def test_build_history_heals_a_summary_stored_with_a_stamp():
+    """HPD-1282 review: a summary that was persisted while r138 stamped it
+    (``[Sat ...] [CONTEXT COMPACTION ...``) must replay clean and unstamped,
+    or it stays unrecognised for good."""
+    from agent.context_compressor import SUMMARY_PREFIX, ContextCompressor
+    from gateway.run import _build_gateway_agent_history
+
+    clean = f"{SUMMARY_PREFIX}\n## Active Task\nweather question"
+    history = [
+        {"role": "user", "content": f"[Sat 2026-10-17 10:37:36 CEST] {clean}",
+         "timestamp": _epoch(2026, 10, 17, 10, 37, 36)},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    agent_history, _ = _build_gateway_agent_history(history, inject_timestamps=True)
+    assert agent_history[0]["content"] == clean
+    assert ContextCompressor._is_context_summary_message(agent_history[0])
+
+    # Also healed when timestamps are off.
+    agent_history, _ = _build_gateway_agent_history(history, inject_timestamps=False)
+    assert agent_history[0]["content"] == clean
+
+
+def test_build_history_keeps_the_stamp_of_a_merged_summary_row():
+    """A merged row starts with real user text; the summary sits after the
+    delimiter and is recognised there, so the row keeps its stamp."""
+    from agent.context_compressor import (
+        SUMMARY_PREFIX,
+        ContextCompressor,
+        _MERGED_SUMMARY_DELIMITER,
+    )
+    from gateway.run import _build_gateway_agent_history
+
+    merged = f"earlier tail{_MERGED_SUMMARY_DELIMITER}{SUMMARY_PREFIX}\nbody"
+    history = [
+        {"role": "user", "content": merged, "timestamp": _epoch(2026, 10, 17, 10, 37, 36)},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    agent_history, _ = _build_gateway_agent_history(history, inject_timestamps=True)
+    assert agent_history[0]["content"].startswith("[Sat 2026-10-17 ")
+    assert ContextCompressor._is_context_summary_message(agent_history[0])
