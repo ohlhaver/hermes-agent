@@ -2304,6 +2304,7 @@ def run_conversation(
                             agent,
                             getattr(agent, "_hpd1151_rough_request_tokens", 0),
                             prompt_tokens,
+                            provider_usage=response.usage,
                         )
                 elif getattr(
                     agent.context_compressor,

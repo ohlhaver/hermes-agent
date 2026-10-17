@@ -97,3 +97,58 @@ def test_failed_write_leaves_no_temp_file(home, monkeypatch):
     a = _Agent(DEEPSEEK)
     tc.calibrate_native_token_ratio(a, 100_000, 117_000)  # must not raise
     assert [p.name for p in home.iterdir() if p.name.startswith(".native_token_ratios.")] == []
+
+
+# HPD-1289: a response that used OpenRouter's server-side web search sums both
+# passes of the search loop into one prompt count and must not calibrate.
+# Shapes and counts from fc-justus-3, 2026-10-17 (Claude Haiku 5.5).
+def _openrouter_usage(prompt, cached, web_search_requests=0, key="server_tool_use"):
+    from openai.types.completion_usage import CompletionUsage
+
+    payload = {
+        "prompt_tokens": prompt,
+        "completion_tokens": 412,
+        "total_tokens": prompt + 412,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
+    if web_search_requests:
+        payload[key] = {"web_search_requests": web_search_requests}
+    # The streamed final chunk's usage as the OpenAI client parses it.
+    return CompletionUsage.model_validate(payload)
+
+
+def test_web_search_usage_is_read_from_the_client_object():
+    assert tc.provider_web_search_requests(_openrouter_usage(132_817, 64_735, 1)) == 1
+    assert tc.provider_web_search_requests(_openrouter_usage(103_013, 50_251, 1, key="server_tool_use_details")) == 1
+    assert tc.provider_web_search_requests(_openrouter_usage(52_412, 50_000)) == 0
+    assert tc.provider_web_search_requests({"server_tool_use": {"web_search_requests": 2}}) == 2
+    assert tc.provider_web_search_requests(None) == 0
+
+
+def test_search_answer_keeps_the_last_good_ratio_and_the_next_preflight_stays_below_85k(home):
+    a = _Agent(HAIKU)
+    tc.native_token_ratio(a)
+    # Clean answer: calibrates (HPD-1151 measurement, ~1.76).
+    tc.calibrate_native_token_ratio(a, 37_200, 65_468, provider_usage=_openrouter_usage(65_468, 60_000))
+    good = a.context_compressor.native_token_ratio
+    assert good == pytest.approx(1.76, abs=0.01)
+    # 10:05:27 call #3: web search, in=132,817 against a rough ~38.5k.
+    tc.calibrate_native_token_ratio(a, 38_536, 132_817, provider_usage=_openrouter_usage(132_817, 64_735, 1))
+    assert a.context_compressor.native_token_ratio == good
+    assert json.loads((home / "native_token_ratios.json").read_text())[HAIKU] == pytest.approx(good, abs=0.001)
+    # The next preflight: rough 38,536 must not read as 115,608 (3.0).
+    assert tc.trigger_pressure_tokens(a, 38_536) < 85_000
+    assert tc.trigger_pressure_tokens(_Agent(HAIKU), 38_536) < 85_000
+
+
+def test_a_stuck_stored_ratio_is_reset_by_the_next_clean_answer(home):
+    (home / "native_token_ratios.json").write_text(json.dumps({HAIKU: 3.0}))
+    a = _Agent(HAIKU)
+    assert tc.native_token_ratio(a) == 3.0
+    # A search answer leaves it alone, the next clean answer repairs memory and disk.
+    tc.calibrate_native_token_ratio(a, 38_536, 132_817, provider_usage=_openrouter_usage(132_817, 64_735, 1))
+    assert a.context_compressor.native_token_ratio == 3.0
+    tc.calibrate_native_token_ratio(a, 29_900, 52_412, provider_usage=_openrouter_usage(52_412, 50_000))
+    assert a.context_compressor.native_token_ratio == pytest.approx(1.75, abs=0.01)
+    assert json.loads((home / "native_token_ratios.json").read_text())[HAIKU] == pytest.approx(1.75, abs=0.01)
+    assert tc.native_token_ratio(_Agent(HAIKU)) == pytest.approx(1.75, abs=0.01)

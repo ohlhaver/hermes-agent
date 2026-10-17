@@ -286,9 +286,61 @@ def native_token_ratio(agent: Any) -> float:
     return seed
 
 
-def calibrate_native_token_ratio(agent: Any, rough_request_tokens: int, provider_prompt_tokens: int) -> None:
-    """Record provider-count / estimate for the request just answered (HPD-1151)."""
+def provider_web_search_requests(usage: Any) -> int:
+    """OpenRouter server-tool web searches reported in a response's usage (HPD-1289).
+
+    OpenRouter puts them under ``server_tool_use_details`` or
+    ``server_tool_use`` as ``web_search_requests``; on a streamed answer the
+    usage is the final chunk's object, which keeps these as extra attributes.
+    """
+    def field(value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(key)
+        found = getattr(value, key, None)
+        if found is None:
+            extra = getattr(value, "model_extra", None)
+            if isinstance(extra, dict):
+                found = extra.get(key)
+        return found
+
+    if usage is None:
+        return 0
+    details = field(usage, "server_tool_use_details")
+    if details is None:
+        details = field(usage, "server_tool_use")
+    if details is None:
+        return 0
+    count = field(details, "web_search_requests")
+    if isinstance(count, bool) or not isinstance(count, (int, float)) or count != count:
+        return 0
+    return max(0, int(count))
+
+
+def calibrate_native_token_ratio(
+    agent: Any,
+    rough_request_tokens: int,
+    provider_prompt_tokens: int,
+    provider_usage: Any = None,
+) -> None:
+    """Record provider-count / estimate for the request just answered (HPD-1151).
+
+    HPD-1289: a response that used OpenRouter's server-side web search does not
+    calibrate. OpenRouter sums both passes of its search loop (the cached first
+    pass plus the second pass with the results) into one prompt count, so the
+    count does not describe the next request. Measured 2026-10-17 on
+    fc-justus-3 with Claude Haiku 5.5: 103,013 / 108,153 / 132,817 with search
+    against a rough estimate of about 38k gave 3.4, clamped to 3.0; the next
+    preflight then read 30,181 x 3.0 = 90,543 >= 85,000 and compressed twice
+    (about 70 s), while the real prompts after compression were 48,797 and
+    52,412 (ratio about 1.7). The last good ratio stays, in memory and on disk.
+    """
     if not _listed_for_native_count(agent):
+        return
+    if provider_web_search_requests(provider_usage) > 0:
+        logger.info(
+            "HPD-1289 native ratio not calibrated: response used server web search (prompt=%s rough=%s)",
+            provider_prompt_tokens, rough_request_tokens,
+        )
         return
     if not (isinstance(rough_request_tokens, int) and rough_request_tokens > 0):
         return
