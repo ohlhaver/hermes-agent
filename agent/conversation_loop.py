@@ -35,6 +35,7 @@ from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     build_turn_context,
     calibrate_native_token_ratio,
+    provider_web_search_requests,
     compose_user_api_content,
     trigger_pressure_tokens,
     reanchor_current_turn_user_idx,
@@ -2296,7 +2297,19 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
-                    agent.context_compressor.update_from_response(usage_dict)
+                    # HPD-1289: OpenRouter sums both passes of its server-side
+                    # web search into prompt_tokens, so that figure is no
+                    # prompt size. Keeping it as last_prompt_tokens would let
+                    # the post-tool check compact mid-turn and would count as
+                    # a compaction that did not clear the threshold. 0 means
+                    # "no reading" (the rough estimate stands in); billing and
+                    # session counters keep the reported figure.
+                    if provider_web_search_requests(response.usage) > 0:
+                        agent.context_compressor.update_from_response(
+                            {**usage_dict, "prompt_tokens": 0}
+                        )
+                    else:
+                        agent.context_compressor.update_from_response(usage_dict)
                     if _ref_usage_added is False:
                         # HPD-1151. Not under MoA: reference usage is added
                         # to prompt_tokens there and would inflate the ratio.

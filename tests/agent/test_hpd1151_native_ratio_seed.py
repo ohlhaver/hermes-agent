@@ -152,3 +152,15 @@ def test_a_stuck_stored_ratio_is_reset_by_the_next_clean_answer(home):
     assert a.context_compressor.native_token_ratio == pytest.approx(1.75, abs=0.01)
     assert json.loads((home / "native_token_ratios.json").read_text())[HAIKU] == pytest.approx(1.75, abs=0.01)
     assert tc.native_token_ratio(_Agent(HAIKU)) == pytest.approx(1.75, abs=0.01)
+
+
+def test_hpd1289_unreadable_web_search_count_warns_once(caplog):
+    import logging
+    from agent import turn_context as tc
+
+    tc._WEB_SEARCH_USAGE_UNREADABLE_WARNED = False
+    with caplog.at_level(logging.WARNING, logger=tc.logger.name):
+        assert tc.provider_web_search_requests({"server_tool_use": {"web_search_requests": "1"}}) == 0
+        assert tc.provider_web_search_requests({"server_tool_use": {}}) == 0
+    assert sum("unreadable" in r.getMessage() for r in caplog.records) == 1
+    assert tc.provider_web_search_requests({"server_tool_use": {"web_search_requests": 2}}) == 2

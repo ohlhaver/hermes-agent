@@ -132,3 +132,41 @@ def test_answer_without_search_still_calibrates(agent):  # noqa: F811
     # A clean answer, also one that reports zero searches, moves the ratio.
     _turn(agent, _final_chunk_usage(int(rough * 1.40), 0, 0))
     assert agent.context_compressor.native_token_ratio == pytest.approx(1.40, abs=0.05)
+
+
+def _search_tool_call_turn(agent, web_search_requests):  # noqa: F811
+    """A search answer (132,817 summed) that also calls a tool, then a clean
+    answer. The post-tool check must not read the summed figure as the size."""
+    tc = SimpleNamespace(id="tc1", type="function",
+                         function=SimpleNamespace(name="web_search", arguments='{"query":"SNB"}'))
+    msg = SimpleNamespace(content=None, tool_calls=[tc], reasoning_content=None, reasoning=None)
+    tool_resp = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="tool_calls")],
+                                model=HAIKU, usage=_final_chunk_usage(132_817, 64_735, web_search_requests))
+    agent.client.chat.completions.create.side_effect = [tool_resp, _response(_final_chunk_usage(48_000, 47_000, None))]
+    compress = MagicMock(side_effect=lambda messages, system, **_k: (messages, system))
+    with (
+        patch("run_agent.handle_function_call", return_value="SNB policy rate 0%"),
+        patch.object(agent, "_compress_context", compress),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+    assert result["completed"] is True
+    return compress.call_count
+
+
+def test_search_answer_with_tool_calls_does_not_compact_mid_turn(agent):  # noqa: F811
+    _setup(agent)
+    agent.compression_enabled = True
+    assert _search_tool_call_turn(agent, 1) == 0
+    # The summed figure is no prompt size: not kept as the last prompt.
+    assert agent.context_compressor.last_prompt_tokens != 132_817
+
+
+def test_same_tool_call_turn_without_search_signal_compacts(agent):  # noqa: F811
+    # Sensitivity check: the same 132,817 reported without server_tool_use_details
+    # is a real prompt size and compacts after the tool call.
+    _setup(agent)
+    agent.compression_enabled = True
+    assert _search_tool_call_turn(agent, None) >= 1

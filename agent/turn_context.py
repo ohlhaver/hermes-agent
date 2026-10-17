@@ -286,6 +286,9 @@ def native_token_ratio(agent: Any) -> float:
     return seed
 
 
+_WEB_SEARCH_USAGE_UNREADABLE_WARNED = False
+
+
 def provider_web_search_requests(usage: Any) -> int:
     """OpenRouter server-tool web searches reported in a response's usage (HPD-1289).
 
@@ -312,6 +315,14 @@ def provider_web_search_requests(usage: Any) -> int:
         return 0
     count = field(details, "web_search_requests")
     if isinstance(count, bool) or not isinstance(count, (int, float)) or count != count:
+        global _WEB_SEARCH_USAGE_UNREADABLE_WARNED
+        if not _WEB_SEARCH_USAGE_UNREADABLE_WARNED:
+            _WEB_SEARCH_USAGE_UNREADABLE_WARNED = True
+            logger.warning(
+                "HPD-1289 server tool usage present but web_search_requests unreadable (%s); "
+                "the answer is treated as without web search",
+                type(count).__name__,
+            )
         return 0
     return max(0, int(count))
 
