@@ -169,6 +169,8 @@ def test_navigate_settles_once_in_isolated_browser():
 def test_long_dialog_keeps_head_buttons_and_end():
     # r152 canary: a 6,000+ character options dialog lost its add button at the end.
     opts = [f'        - checkbox "Option {i} +CHF4.00" [checked=false, ref=e{1000 + i}]' for i in range(400)]
+    opts[200] = '        - button "Größe wählen" [ref=e7777]'
+    opts[2] = '        - radio "Gross" [checked=false, ref=e7778]'
     lines = (['- main [ref=e1]:', '  - link "nav" [ref=e2]', '- dialog "Pizza" [ref=e3]:',
               '    - heading "Pizza Margherita" [level=1, ref=e4]',
               '    - button "Mehr Info" [ref=e5]'] + opts
@@ -178,6 +180,7 @@ def test_long_dialog_keeps_head_buttons_and_end():
     assert len(head) <= bt._DIALOG_BLOCK_MAX_CHARS + 200
     assert 'Pizza Margherita' in head and 'Hinzufügen 1 CHF18.90' in head and 'ref=e9001' in head
     assert 'Mehr Info' in head and 'lines of this dialog omitted' in head
+    assert 'ref=e7777' in head and 'ref=e7778' in head  # a middle button and a middle radio survive
     assert 'link "nav"' in rest
 
 

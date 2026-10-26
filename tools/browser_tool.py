@@ -2789,6 +2789,7 @@ _DIALOG_LINE_RE = re.compile(
 _DIALOG_BLOCK_MAX_CHARS = 6000
 
 _BUTTON_LINE_RE = re.compile(r'^\s*-\s+(?:button|link|menuitem|tab)\b.*\[[^\]]*\bref=')
+_CONTROL_LINE_RE = re.compile(r'^\s*-\s+(?:radio|checkbox|combobox|textbox|option|spinbutton|switch)\b.*\[[^\]]*\bref=')
 
 
 def _shrink_dialog_block(block: list[str]) -> str:
@@ -2815,13 +2816,18 @@ def _shrink_dialog_block(block: list[str]) -> str:
     j = len(block)
     while j > i and n + len(block[j - 1]) + 1 <= tail_budget:
         j -= 1; tail.insert(0, block[j]); n += len(block[j]) + 1
-    middle = [line for line in block[i:j] if _BUTTON_LINE_RE.match(line)]
-    kept: list[str] = []
+    # Buttons and links first, then other form controls, as far as the budget reaches; original order kept.
+    inner = block[i:j]
+    chosen: set[int] = set()
     n = 0
-    for line in middle:
-        if n + len(line) + 1 > mid_budget:
-            break
-        kept.append(line); n += len(line) + 1
+    for pattern in (_BUTTON_LINE_RE, _CONTROL_LINE_RE):
+        for k, line in enumerate(inner):
+            if k in chosen or not pattern.match(line):
+                continue
+            if n + len(line) + 1 > mid_budget:
+                break
+            chosen.add(k); n += len(line) + 1
+    kept = [inner[k] for k in sorted(chosen)]
     omitted = (j - i) - len(kept)
     marker = f'{" " * 2}[... {omitted} lines of this dialog omitted; buttons and links among them are listed below ...]'
     return '\n'.join(head + [marker] + kept + tail)
