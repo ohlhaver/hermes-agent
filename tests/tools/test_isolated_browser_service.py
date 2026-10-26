@@ -97,7 +97,7 @@ def test_public_open_uses_service_validator_with_local_dns_unavailable(executor_
 
 def test_standalone_default_still_fails_closed_on_dns_failure(executor_factory):
     executor, calls = executor_factory()
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         executor.execute("open", ["https://example.com/"])
     assert calls == []
 
@@ -110,7 +110,7 @@ def test_standalone_default_still_fails_closed_on_dns_failure(executor_factory):
 ])
 def test_trusted_validator_cannot_override_literal_floor(executor_factory, url):
     executor, calls = executor_factory(lambda _: True)
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         executor.execute("open", [url])
     assert calls == []
 
@@ -118,7 +118,7 @@ def test_trusted_validator_cannot_override_literal_floor(executor_factory, url):
 @pytest.mark.parametrize("result", [False, None, {}, "PUBLIC", 1])
 def test_unavailable_or_non_boolean_validation_fails_closed(executor_factory, result):
     executor, calls = executor_factory(lambda _: result)
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         executor.execute("open", ["https://example.com/"])
     assert calls == []
 
@@ -129,24 +129,24 @@ def test_validator_exception_is_finite_and_private(executor_factory):
     executor, calls = executor_factory(unavailable)
     with pytest.raises(BrowserBoundaryError) as error:
         executor.execute("open", ["https://example.com/"])
-    assert str(error.value) == "command_denied"
+    assert str(error.value) == "blocked_target"
     assert calls == []
 
 
 def test_redirect_is_validated_before_observation(executor_factory):
     executor, _ = executor_factory(lambda url: url == "https://example.com/")
     executor.pages = lambda: [{"url": "https://private-name.example/"}]
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         executor.execute("snapshot", [])
 
 
 def test_website_policy_is_preserved_for_open_and_redirect(executor_factory, monkeypatch):
     executor, calls = executor_factory(lambda _: True)
     monkeypatch.setattr(bt, "check_website_access", lambda _: "blocked by website policy")
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         executor.execute("open", ["https://example.com/"])
     assert calls == []
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         executor.execute("snapshot", [])
 
 
@@ -163,7 +163,7 @@ def test_agent_rpc_cannot_replace_service_validator(executor_factory):
     boundary = IsolatedBrowserBoundary(lease, executor.execute, executor.safe_return,
         agent_uid=os.geteuid()+1, management_uid=os.geteuid(),
         session_id="synthetic", expires_at=time.time()+300)
-    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+    with pytest.raises(BrowserBoundaryError, match="blocked_target"):
         boundary.dispatch(boundary.agent_uid, {"session_id": "synthetic", "method": "browser.command",
             "command": "open", "args": ["https://example.com/"], "trusted_url_validator": True})
     assert calls == []

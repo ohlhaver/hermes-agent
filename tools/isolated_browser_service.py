@@ -411,8 +411,11 @@ class NativeBrowserExecutor:
         from agent.redact import redact_sensitive_text
         with self.lock:
             if command == "open":
-                if len(args) != 1 or not self._url_allowed(args[0]):
+                if len(args) != 1:
                     raise BrowserBoundaryError("command_denied")
+                if not self._url_allowed(args[0]):
+                    # Own code: "this address cannot be opened" is not "command not allowed".
+                    raise BrowserBoundaryError("blocked_target")
             result = self.bt._run_browser_command(self.session_id, command, args)
             if not result.get("success"):
                 return {"success": False, "error": "Browser action failed; user takeover may be required."}
@@ -422,7 +425,7 @@ class NativeBrowserExecutor:
             for page in pages:
                 url = page.get("url", "")
                 if url != "about:blank" and not self._url_allowed(url):
-                    raise BrowserBoundaryError("command_denied")
+                    raise BrowserBoundaryError("blocked_target")
             data = result.get("data", {})
             if isinstance(data, dict) and isinstance(data.get("url"), str):
                 data["url"] = public_url(data["url"])

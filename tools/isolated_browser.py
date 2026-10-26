@@ -344,14 +344,54 @@ class BrowserRpcHandler(socketserver.StreamRequestHandler):
             pass
 
 
-def command_from_agent(socket_path: str, session_id: str, command: str, args: list):
-    """No local/cloud fallback when the protected endpoint fails."""
+# One text per refusal code. The model reads these literally (Uber Eats session
+# 2026-10-26: a refused screenshot was reported as "paused" and the task stopped
+# although the browser was working), so each states its own cause and next step.
+_AGENT_ERROR_TEXT = {
+    "command_denied": (
+        "That command is not available in the protected browser; the browser is working. "
+        "Continue with browser_snapshot, browser_click, browser_type or browser_navigate."
+    ),
+    "human_has_control": (
+        "The user has taken over the browser and is controlling it right now. "
+        "Wait for the hand-back or ask the user to return control."
+    ),
+    "handoff_pending": (
+        "A hand-over of the browser is in progress and did not finish within about 20 seconds. "
+        "Try the same step again."
+    ),
+    "session_expired": (
+        "The browser session has ended. Open the page again with browser_navigate."
+    ),
+    "blocked_target": (
+        "This address cannot be opened (it does not exist or is not a public website). "
+        "Check the address or search for the right page; the browser is working."
+    ),
+    "browser_unavailable": (
+        "The protected browser did not answer, also not after waiting about 20 seconds. "
+        "Try browser_navigate to the same page once more; only if that fails too, report it."
+    ),
+}
+# Codes that mean "not ready yet": wait and retry before telling the model.
+_RETRY_CODES = {"browser_unavailable", "handoff_pending"}
+_READ_ONLY_COMMANDS = {"open", "snapshot", "get", "eval"}
+RETRY_WINDOW_SECONDS = 20.0
+RETRY_INTERVAL_SECONDS = 2.0
+
+
+def _command_once(socket_path: str, session_id: str, command: str, args: list):
+    """One attempt. Returns the result dict of a success, else a failure dict."""
     try:
         if not os.path.isabs(socket_path):
             raise ValueError("socket must be absolute")
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(40)
-            client.connect(socket_path)
+            try:
+                client.connect(socket_path)
+            except OSError:
+                # Nothing was sent: safe to retry whatever the command is.
+                return {"success": False, "code": "browser_unavailable",
+                        "error": _AGENT_ERROR_TEXT["browser_unavailable"], "_retry_safe": True}
             body = json.dumps({"method": "browser.command", "session_id": session_id,
                                "command": command, "args": args}, separators=(",", ":")).encode() + b"\n"
             if len(body) > MAX_MESSAGE:
@@ -365,10 +405,9 @@ def command_from_agent(socket_path: str, session_id: str, command: str, args: li
             if response.get("ok") is True and isinstance(response.get("result"), dict):
                 return response["result"]
             code = response.get("code")
-            if code not in {"human_has_control", "session_expired", "command_denied", "handoff_pending"}:
+            if code not in _AGENT_ERROR_TEXT:
                 code = "browser_unavailable"
-            result = {"success": False, "code": code,
-                      "error": "Browser is paused or unavailable. Ask the user to take over or return control."}
+            result = {"success": False, "code": code, "error": _AGENT_ERROR_TEXT[code]}
             href = response.get("takeover_href")
             if valid_takeover_href(session_id, href) and response.get("needs_user_takeover") is True:
                 result.update(takeover_href=href, needs_user_takeover=True)
@@ -376,4 +415,27 @@ def command_from_agent(socket_path: str, session_id: str, command: str, args: li
             return result
     except Exception:
         return {"success": False, "code": "browser_unavailable",
-                "error": "Protected browser connection is unavailable."}
+                "error": _AGENT_ERROR_TEXT["browser_unavailable"]}
+
+
+def command_from_agent(socket_path: str, session_id: str, command: str, args: list):
+    """No local/cloud fallback when the protected endpoint fails.
+
+    "Not ready" answers (warm-up, connection refused, hand-over in progress) are
+    retried for about 20 seconds before the model hears about them; refusals that
+    will not change (command_denied, human_has_control, session_expired) return at once.
+    """
+    deadline = time.monotonic() + RETRY_WINDOW_SECONDS
+    while True:
+        result = _command_once(socket_path, session_id, command, args)
+        safe = result.pop("_retry_safe", False) if isinstance(result, dict) else False
+        if result.get("success") is not False or result.get("code") not in _RETRY_CODES:
+            return result
+        # A click/fill/type that may already have run is never repeated blindly:
+        # retry only when nothing was sent, the broker refused before acting
+        # (handoff_pending), or the command only reads.
+        if not (safe or result["code"] == "handoff_pending" or command in _READ_ONLY_COMMANDS):
+            return result
+        if time.monotonic() + RETRY_INTERVAL_SECONDS > deadline:
+            return result
+        time.sleep(RETRY_INTERVAL_SECONDS)
