@@ -2788,6 +2788,44 @@ _DIALOG_LINE_RE = re.compile(
 )
 _DIALOG_BLOCK_MAX_CHARS = 6000
 
+_BUTTON_LINE_RE = re.compile(r'^\s*-\s+(?:button|link|menuitem|tab)\b.*\[[^\]]*\bref=')
+
+
+def _shrink_dialog_block(block: list[str]) -> str:
+    """Fit one dialog into _DIALOG_BLOCK_MAX_CHARS without a hard cut.
+
+    The primary action of an options dialog (Uber Eats "Hinzufuegen") sits at its end,
+    after a long option list; a plain cut at the cap lost it (r152 canary 2026-10-26,
+    dialog 6,044 characters). A block over the cap keeps its head, every button/link
+    line of the omitted middle (names and refs), and its end.
+    """
+    text = '\n'.join(block)
+    if len(text) <= _DIALOG_BLOCK_MAX_CHARS:
+        return text
+    head_budget = _DIALOG_BLOCK_MAX_CHARS * 3 // 10
+    tail_budget = _DIALOG_BLOCK_MAX_CHARS * 4 // 10
+    mid_budget = _DIALOG_BLOCK_MAX_CHARS - head_budget - tail_budget - 120
+    head: list[str] = []
+    n = 0
+    i = 0
+    while i < len(block) and n + len(block[i]) + 1 <= head_budget:
+        head.append(block[i]); n += len(block[i]) + 1; i += 1
+    tail: list[str] = []
+    n = 0
+    j = len(block)
+    while j > i and n + len(block[j - 1]) + 1 <= tail_budget:
+        j -= 1; tail.insert(0, block[j]); n += len(block[j]) + 1
+    middle = [line for line in block[i:j] if _BUTTON_LINE_RE.match(line)]
+    kept: list[str] = []
+    n = 0
+    for line in middle:
+        if n + len(line) + 1 > mid_budget:
+            break
+        kept.append(line); n += len(line) + 1
+    omitted = (j - i) - len(kept)
+    marker = f'{" " * 2}[... {omitted} lines of this dialog omitted; buttons and links among them are listed below ...]'
+    return '\n'.join(head + [marker] + kept + tail)
+
 
 def _hoist_dialogs(snapshot_text: str) -> str:
     """Move open dialogs/modals to the top of a snapshot.
@@ -2819,10 +2857,10 @@ def _hoist_dialogs(snapshot_text: str) -> str:
     head: list[str] = []
     used = 0
     for block in blocks:
-        text = '\n'.join(block)
+        text = _shrink_dialog_block(block)
         if used + len(text) > _DIALOG_BLOCK_MAX_CHARS and head:
             break
-        head.append(text[:_DIALOG_BLOCK_MAX_CHARS])
+        head.append(text)
         used += len(text)
     rest = [line for line, t in zip(lines, taken) if not t]
     return ('[OPEN DIALOG / MODAL: act inside it first]\n' + '\n'.join(head)

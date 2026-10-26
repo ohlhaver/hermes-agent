@@ -164,3 +164,23 @@ def test_navigate_settles_once_in_isolated_browser():
         out = json.loads(bt.browser_navigate("https://sbb.ch/x", task_id="t"))
     assert calls.count("snapshot") == 2 and sl.called
     assert out["element_count"] == 30
+
+
+def test_long_dialog_keeps_head_buttons_and_end():
+    # r152 canary: a 6,000+ character options dialog lost its add button at the end.
+    opts = [f'        - checkbox "Option {i} +CHF4.00" [checked=false, ref=e{1000 + i}]' for i in range(400)]
+    lines = (['- main [ref=e1]:', '  - link "nav" [ref=e2]', '- dialog "Pizza" [ref=e3]:',
+              '    - heading "Pizza Margherita" [level=1, ref=e4]',
+              '    - button "Mehr Info" [ref=e5]'] + opts
+             + ['    - button "Hinzufügen 1 CHF18.90" [ref=e9001]', '    - button "Schließen" [ref=e9002]'])
+    out = bt._hoist_dialogs('\n'.join(lines))
+    head, _, rest = out.partition('[END DIALOG]')
+    assert len(head) <= bt._DIALOG_BLOCK_MAX_CHARS + 200
+    assert 'Pizza Margherita' in head and 'Hinzufügen 1 CHF18.90' in head and 'ref=e9001' in head
+    assert 'Mehr Info' in head and 'lines of this dialog omitted' in head
+    assert 'link "nav"' in rest
+
+
+def test_short_dialog_is_not_shrunk():
+    lines = ['- dialog "d" [ref=e1]:', '  - button "OK" [ref=e2]']
+    assert bt._shrink_dialog_block(lines) == '\n'.join(lines)
