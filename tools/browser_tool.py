@@ -255,6 +255,8 @@ MIN_FIRST_OPEN_TIMEOUT = 120
 # web_extract paths share the same truncate-and-store pattern, so the model
 # gets the same per-page budget from both.
 SNAPSHOT_SUMMARIZE_THRESHOLD = 15000
+_ISOLATED_MIN_ELEMENTS = 10
+_ISOLATED_SETTLE_SECONDS = 2.0
 
 # Hard ceiling on the full-snapshot file written to cache/web when a snapshot
 # is truncated or LLM-summarized. Mirrors web_tools.MAX_STORED_TEXT_CHARS —
@@ -2781,6 +2783,52 @@ def _extract_relevant_content(
         return _truncate_snapshot(snapshot_text)
 
 
+_DIALOG_LINE_RE = re.compile(
+    r'^(?P<indent>\s*)-\s+(?:dialog|alertdialog)\b|^(?P<indent2>\s*)-\s+\S.*\[[^\]]*\bmodal\b[^\]]*\]'
+)
+_DIALOG_BLOCK_MAX_CHARS = 6000
+
+
+def _hoist_dialogs(snapshot_text: str) -> str:
+    """Move open dialogs/modals to the top of a snapshot.
+
+    Page header and navigation can fill the first 15,000 characters, so an
+    options dialog opened by a click (Uber Eats "Quick Add") would be cut off.
+    The accessibility tree marks them as role dialog/alertdialog or modal; the
+    whole subtree moves first, refs unchanged. Capped so the page still shows.
+    """
+    lines = snapshot_text.split('\n')
+    taken = [False] * len(lines)
+    blocks: list[list[str]] = []
+    i = 0
+    while i < len(lines):
+        m = _DIALOG_LINE_RE.match(lines[i])
+        if not m or taken[i]:
+            i += 1
+            continue
+        indent = len(m.group('indent') if m.group('indent') is not None else m.group('indent2'))
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or len(lines[j]) - len(lines[j].lstrip()) > indent):
+            j += 1
+        blocks.append(lines[i:j])
+        for k in range(i, j):
+            taken[k] = True
+        i = j
+    if not blocks:
+        return snapshot_text
+    head: list[str] = []
+    used = 0
+    for block in blocks:
+        text = '\n'.join(block)
+        if used + len(text) > _DIALOG_BLOCK_MAX_CHARS and head:
+            break
+        head.append(text[:_DIALOG_BLOCK_MAX_CHARS])
+        used += len(text)
+    rest = [line for line, t in zip(lines, taken) if not t]
+    return ('[OPEN DIALOG / MODAL: act inside it first]\n' + '\n'.join(head)
+            + '\n[END DIALOG]\n' + '\n'.join(rest))
+
+
 def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_THRESHOLD) -> str:
     """Structure-aware truncation for snapshots.
 
@@ -2800,6 +2848,7 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = SNAPSHOT_SUMMARIZE_T
     if len(snapshot_text) <= max_chars:
         return snapshot_text
 
+    snapshot_text = _hoist_dialogs(snapshot_text)
     stored_path = _store_full_snapshot(snapshot_text)
 
     lines = snapshot_text.split('\n')
@@ -3056,6 +3105,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # without a separate browser_snapshot call.
         try:
             snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
+            if _isolated_browser_binding() is not None and snap_result.get("success"):
+                # A page still loading comes back as one generic element (sbb.ch,
+                # 2026-10-26). Wait once and look again before the model sees it.
+                _d = snap_result.get("data", {})
+                if not title or len(_d.get("refs", {}) or {}) < _ISOLATED_MIN_ELEMENTS:
+                    time.sleep(_ISOLATED_SETTLE_SECONDS)
+                    _again = _run_browser_command(nav_session_key, "snapshot", ["-c"])
+                    if _again.get("success"):
+                        snap_result = _again
             if snap_result.get("success"):
                 snap_data = snap_result.get("data", {})
                 snapshot_text = snap_data.get("snapshot", "")
@@ -3071,10 +3129,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(response, ensure_ascii=False)
     else:
-        return json.dumps({
+        response = {
             "success": False,
             "error": result.get("error", "Navigation failed")
-        }, ensure_ascii=False)
+        }
+        if result.get("code"):
+            response["code"] = result["code"]
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
 def browser_snapshot(
@@ -3144,7 +3205,7 @@ def browser_snapshot(
 
         # Check if snapshot needs summarization
         if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
-            snapshot_text = _extract_relevant_content(snapshot_text, user_task)
+            snapshot_text = _extract_relevant_content(_hoist_dialogs(snapshot_text), user_task)
         elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
             snapshot_text = _truncate_snapshot(snapshot_text)
 
@@ -3174,6 +3235,8 @@ def browser_snapshot(
             "success": False,
             "error": result.get("error", "Failed to get snapshot")
         }
+        if result.get("code"):
+            response["code"] = result["code"]
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
@@ -4831,6 +4894,18 @@ def check_browser_requirements() -> bool:
     return True
 
 
+def check_browser_unprotected_only_requirements() -> bool:
+    """Tools the protected (isolated) browser refuses on purpose are not offered.
+
+    The broker denies screenshots, the console buffer and free JavaScript, so
+    advertising browser_vision/browser_console there only spends model calls on
+    refusals (Uber Eats session 2026-10-26: 16 refused calls).
+    """
+    if _isolated_browser_binding() is not None:
+        return False
+    return check_browser_requirements()
+
+
 def check_browser_vision_requirements() -> bool:
     """Whether ``browser_vision`` should be advertised to the model.
 
@@ -4840,7 +4915,7 @@ def check_browser_vision_requirements() -> bool:
     fails at call time with a cryptic provider-side error like
     ``unknown variant `image_url`, expected `text``` (issue #31179).
     """
-    if not check_browser_requirements():
+    if not check_browser_unprotected_only_requirements():
         return False
     try:
         from tools.vision_tools import check_vision_requirements
@@ -4991,6 +5066,6 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=check_browser_unprotected_only_requirements,
     emoji="🖥️",
 )
