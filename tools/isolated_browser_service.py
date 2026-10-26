@@ -107,6 +107,135 @@ def clear_remote_clipboard(socket_path):
             raise BrowserBoundaryError("unsafe_return")
         raise BrowserBoundaryError("unsafe_return")
 
+CARD_FIELD_NAMES = frozenset({"number", "expiry", "cvc", "name"})
+
+
+def _card_host(value):
+    """Approved merchant host: a plain DNS name, nothing else may receive a card."""
+    if not isinstance(value, str):
+        return None
+    host = value.strip().lower().rstrip(".")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    labels = host.split(".")
+    if (len(host) > 253 or len(labels) < 2 or any(not 0 < len(l) <= 63 or l.startswith("-") or l.endswith("-")
+            or not all(c.isalnum() or c == "-" for c in l) for l in labels)):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        return host
+
+
+def _card_url_matches(url, host):
+    """True for an https URL on the approved host or one of its subdomains."""
+    try:
+        target = urlsplit(url)
+        page = (target.hostname or "").lower().rstrip(".")
+        return (target.scheme == "https" and target.username is None and target.password is None
+                and (page == host or page.endswith("." + host)))
+    except ValueError:
+        return False
+
+
+class _Cdp:
+    def __init__(self, ws):
+        self.ws, self.seq = ws, 0
+
+    def call(self, method, params=None):
+        self.seq += 1
+        self.ws.send(json.dumps({"id": self.seq, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = json.loads(self.ws.recv(timeout=max(.01, deadline - time.monotonic())))
+            if result.get("id") == self.seq:
+                if "error" in result:
+                    raise BrowserBoundaryError("card_fill_failed")
+                return result.get("result", {})
+        raise BrowserBoundaryError("card_fill_failed")
+
+
+# HPD-1722: typed into the page by the broker, never by a process the model can
+# reach. Runs in an isolated world (page scripts cannot override the setters or
+# read the arguments); the host is checked again here, at the moment of typing.
+CARD_FILL_JS = r"""((approvedHost, values) => {
+  const host = location.hostname.toLowerCase().replace(/\.$/, '');
+  if (!(host === approvedHost || host.endsWith('.' + approvedHost))) return {host_mismatch: true};
+  const setters = {
+    input: Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set,
+    textarea: Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set,
+  };
+  const pattern = {
+    number: /(card.?(number|no\b|num)|cc.?(num|number)|kartennummer|karten-nr|num[eé]ro de carte|n[uú]mero de tarjeta|numero carta)/i,
+    expiry: /(expir|exp\.?\s?date|mm\s*\/\s*(yy|jj|aa)|g[uü]ltig|valid (thru|until)|ablauf|date d.expiration)/i,
+    cvc: /(cvc|cvv|csc|security.?code|verification.?(code|number)|pr[uü]fziffer|sicherheitscode|code de s[eé]curit)/i,
+    name: /(name on card|card.?holder|cardholder|karteninhaber|inhaber|titulaire|titular)/i,
+  };
+  const roots = [document];
+  const inputs = [];
+  for (let i = 0; i < roots.length; i++) {
+    for (const el of roots[i].querySelectorAll('*')) {
+      if (el.shadowRoot) roots.push(el.shadowRoot);
+      if (el instanceof HTMLInputElement && !['checkbox','radio','button','submit','file','hidden','image','reset'].includes(el.type)) inputs.push(el);
+    }
+  }
+  const visible = (el) => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return !el.disabled && !el.readOnly && r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const label = (el) => {
+    const parts = [el.name, el.id, el.placeholder, el.getAttribute('aria-label')];
+    if (el.labels) for (const l of el.labels) parts.push(l.textContent);
+    const by = el.getAttribute('aria-labelledby');
+    if (by) for (const id of by.split(/\s+/)) { const n = document.getElementById(id); if (n) parts.push(n.textContent); }
+    return parts.filter(Boolean).join(' ');
+  };
+  const byAuto = (token) => inputs.find((el) => visible(el) && (el.autocomplete || '').split(/\s+/).includes(token));
+  const byText = (field) => inputs.find((el) => {
+    if (!visible(el)) return false;
+    const text = label(el);
+    if (!pattern[field].test(text)) return false;
+    return field === 'cvc' || field === 'expiry' || !pattern.cvc.test(text);
+  });
+  const put = (el, value) => {
+    el.focus();
+    (el instanceof HTMLTextAreaElement ? setters.textarea : setters.input).call(el, value);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.blur();
+  };
+  const filled = [];
+  const targets = {
+    number: byAuto('cc-number') || byText('number'),
+    cvc: byAuto('cc-csc') || byText('cvc'),
+    name: byAuto('cc-name') || byText('name'),
+  };
+  const combined = byAuto('cc-exp') || null;
+  const month = byAuto('cc-exp-month'), year = byAuto('cc-exp-year');
+  for (const field of ['number', 'cvc', 'name']) {
+    if (targets[field] && values[field]) { put(targets[field], values[field]); filled.push(field); }
+  }
+  if (values.expiry) {
+    if (combined) {
+      const wide = (combined.maxLength || 0) >= 7;
+      put(combined, wide && values.expiry_long ? values.expiry_long : values.expiry);
+      filled.push('expiry');
+    } else if (month && year) {
+      const [mm, yy] = values.expiry.split('/');
+      put(month, mm);
+      put(year, (year.maxLength || 0) === 4 && values.expiry_long ? values.expiry_long.split('/')[1] : yy);
+      filled.push('expiry');
+    } else {
+      const other = byText('expiry');
+      if (other) { put(other, values.expiry); filled.push('expiry'); }
+    }
+  }
+  return {filled};
+})"""
+
 
 class NativeBrowserExecutor:
     def __init__(self, session_id, *, trusted_url_validator: Callable[[str], bool] | None = None):
@@ -206,6 +335,67 @@ class NativeBrowserExecutor:
                     data["result"] = public_url(data["result"])
             return json.loads(redact_sensitive_text(json.dumps(result), force=True))
 
+    def fill_card(self, approved_host, fields):
+        """Type one approved payment's card into the visible page. Names only come back.
+
+        The host check uses the page's real URL read from the browser here, never
+        a value the caller supplies. Only the visible tab and its same-host frames
+        are typed into; a frame on another host (a payment iframe) is left alone.
+        """
+        host = _card_host(approved_host)
+        if host is None:
+            raise BrowserBoundaryError("command_denied")
+        values = {key: fields[key] for key in fields}
+        with self.lock:
+            targets = []
+            for page in self.pages():
+                url = page.get("url", "")
+                if url == "about:blank":
+                    continue
+                if not page.get("webSocketDebuggerUrl"):
+                    continue
+                targets.append(page)
+            filled, seen_visible, mismatch = set(), False, False
+            for page in targets:
+                with connect(page["webSocketDebuggerUrl"], open_timeout=3, max_size=2 * 1024 * 1024) as ws:
+                    cdp = _Cdp(ws)
+                    tree = cdp.call("Page.getFrameTree")["frameTree"]
+                    main_world = cdp.call("Page.createIsolatedWorld", {"frameId": tree["frame"]["id"],
+                                                                       "worldName": "hermes-private-card"})["executionContextId"]
+                    state = cdp.call("Runtime.evaluate", {"contextId": main_world, "returnByValue": True,
+                                                         "expression": "document.visibilityState"})
+                    if state.get("result", {}).get("value") != "visible":
+                        continue
+                    seen_visible = True
+                    frames = [tree]
+                    for frame in frames:
+                        frames.extend(frame.get("childFrames", []))
+                        info = frame["frame"]
+                        if not _card_url_matches(info.get("url", ""), host):
+                            if info["id"] == tree["frame"]["id"]:
+                                mismatch = True
+                                break
+                            continue
+                        ctx = cdp.call("Page.createIsolatedWorld", {"frameId": info["id"],
+                                                                    "worldName": "hermes-private-card"})["executionContextId"]
+                        outcome = cdp.call("Runtime.evaluate", {
+                            "contextId": ctx, "returnByValue": True,
+                            "expression": CARD_FILL_JS + "(" + json.dumps(host) + "," + json.dumps(values) + ")"})
+                        value = outcome.get("result", {}).get("value")
+                        if outcome.get("exceptionDetails") or not isinstance(value, dict):
+                            continue
+                        if value.get("host_mismatch"):
+                            mismatch = True
+                            break
+                        filled.update(name for name in value.get("filled", []) if name in CARD_FIELD_NAMES)
+            values.clear()
+        if mismatch and not filled:
+            raise BrowserBoundaryError("host_mismatch")
+        if not seen_visible:
+            raise BrowserBoundaryError("no_visible_page")
+        order = ("number", "expiry", "cvc", "name")
+        return {"filled": [n for n in order if n in filled], "missing": [n for n in order if n not in filled]}
+
     def safe_return(self):
         # Runs only after input is fenced, under the broker's human lease.
         # Isolated-world DOM access avoids page-overridden JS getters/setters.
@@ -278,6 +468,7 @@ async def run(manifest, *, trusted_url_validator: Callable[[str], bool] | None =
     boundary = NativeSessionBoundary(lease, executor.execute, executor.safe_return,
         agent_uid=manifest["agent_uid"], management_uid=manifest["management_uid"],
         session_id=manifest["session_id"], expires_at=manifest["expires_at"], takeover_href=manifest.get("takeover_href"))
+    boundary.card_fill = getattr(executor, "fill_card", None)
     viewer = boundary.viewer = NativeRfbViewer(boundary, runtime.rfb_socket_path())
     servers = []
     running_servers = []

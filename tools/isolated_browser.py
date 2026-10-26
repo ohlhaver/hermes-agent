@@ -39,6 +39,9 @@ class BrowserBoundaryError(RuntimeError):
         self.code = code
 
 
+CARD_FILL_KEYS = frozenset({"number", "expiry", "expiry_long", "cvc", "name"})
+
+
 class IsolatedBrowserBoundary:
     """One broker process/profile/browser per product-bound session.
 
@@ -70,6 +73,9 @@ class IsolatedBrowserBoundary:
         self.ready_viewer = None
         self.viewer_id = None
         self.transition = False
+        # HPD-1722: set by a trusted service that can type a payment card into
+        # the page itself. Only the management caller reaches it (see dispatch).
+        self.card_fill = None
 
     def handoff_metadata(self, uid, request, response):
         with self.condition:
@@ -155,6 +161,28 @@ class IsolatedBrowserBoundary:
                 if command in {"click", "fill"} and (not args or not re.fullmatch(r"@?e\d+", args[0])):
                     raise BrowserBoundaryError("command_denied")
                 self.active += 1
+            elif method == "card.fill":
+                # HPD-1722: the management agent (UID 0, never the model's
+                # container) hands over one approved payment's card fields; the
+                # broker types them into the page itself, after checking the
+                # page's real host. Admitted like an agent action: not while a
+                # human holds the browser, and drained before a hand-over.
+                if self.card_fill is None:
+                    raise BrowserBoundaryError("unknown_method")
+                if self.lease.get().holder != self.lease.AGENT:
+                    raise BrowserBoundaryError("human_has_control")
+                admitted = self.lease.assert_agent_may_act()
+                if self.transition:
+                    raise BrowserBoundaryError("handoff_pending")
+                approved_host, fields = request.get("approved_host"), request.get("fields")
+                if (set(request) - {"session_id", "method", "approved_host", "fields"}
+                        or not isinstance(approved_host, str) or not isinstance(fields, dict)
+                        or not fields or set(fields) - CARD_FILL_KEYS
+                        or any(not isinstance(v, str) or not 0 < len(v) <= 64 for v in fields.values())):
+                    raise BrowserBoundaryError("command_denied")
+                self.active += 1
+                filler = self.card_fill
+                command, args = None, None
             else:
                 if method == "display.status":
                     return self.lease.public_view(self.lease.get())
@@ -234,7 +262,10 @@ class IsolatedBrowserBoundary:
                 raise BrowserBoundaryError("unknown_method")
 
         try:
-            result = self.execute(command, args)
+            if command is None:
+                result = filler(approved_host, fields)
+            else:
+                result = self.execute(command, args)
             with self.condition:
                 self._bound(request)
                 if self.lease.get().epoch != admitted.epoch:

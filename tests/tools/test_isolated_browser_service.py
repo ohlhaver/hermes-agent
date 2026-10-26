@@ -187,3 +187,176 @@ def test_service_wires_only_constructor_callback_not_manifest(monkeypatch, suppl
     with pytest.raises(StopAfterProvision):
         asyncio.run(service.run(manifest, **kwargs))
     assert observed == [("synthetic", callback if supply_callback else None)]
+
+
+# --- HPD-1722: the broker types the card; no process the model reaches can fetch it ---
+
+FIELDS = {"number": "4242424242424242", "expiry": "12/28", "expiry_long": "12/2028", "cvc": "123", "name": "Max Muster"}
+
+
+def _boundary(filler):
+    boundary = IsolatedBrowserBoundary(lease, lambda *_: {"success": True}, lambda: True,
+        agent_uid=os.geteuid() + 1, management_uid=os.geteuid(),
+        session_id="synthetic", expires_at=time.time() + 300)
+    boundary.card_fill = filler
+    return boundary
+
+
+def _card_request(**extra):
+    request = {"session_id": "synthetic", "method": "card.fill", "approved_host": "shop.example.ch", "fields": dict(FIELDS)}
+    request.update(extra)
+    return request
+
+
+def test_card_fill_is_a_management_method_only(monkeypatch):
+    seen = []
+    boundary = _boundary(lambda host, fields: seen.append((host, dict(fields))) or {"filled": ["number"], "missing": []})
+    # The model's channel (agent uid) can never call it, even with valid fields.
+    with pytest.raises(BrowserBoundaryError, match="caller_denied"):
+        boundary.dispatch(boundary.agent_uid, _card_request())
+    assert seen == []
+    assert boundary.dispatch(boundary.management_uid, _card_request()) == {"filled": ["number"], "missing": []}
+    assert seen == [("shop.example.ch", FIELDS)]
+
+
+def test_card_fill_absent_without_a_trusted_service_filler():
+    boundary = _boundary(None)
+    with pytest.raises(BrowserBoundaryError, match="unknown_method"):
+        boundary.dispatch(boundary.management_uid, _card_request())
+
+
+@pytest.mark.parametrize("bad", [
+    {"fields": {"number": "4242", "pan": "1"}},
+    {"fields": {}},
+    {"fields": {"number": ""}},
+    {"fields": {"number": "4" * 65}},
+    {"fields": {"number": 4242424242424242}},
+    {"approved_host": 7},
+    {"extra": "x"},
+])
+def test_card_fill_rejects_malformed_requests(bad):
+    called = []
+    boundary = _boundary(lambda *_: called.append(1))
+    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+        boundary.dispatch(boundary.management_uid, _card_request(**bad))
+    assert called == [] and boundary.active == 0
+
+
+def test_card_fill_waits_for_nothing_while_a_human_holds_the_browser():
+    called = []
+    boundary = _boundary(lambda *_: called.append(1))
+    lease.acquire("human-fixture")
+    try:
+        with pytest.raises(BrowserBoundaryError, match="human_has_control"):
+            boundary.dispatch(boundary.management_uid, _card_request())
+    finally:
+        lease.release("human-fixture")
+    assert called == []
+
+
+class _Ws:
+    """A scripted CDP page: records every Runtime.evaluate expression."""
+    def __init__(self, page):
+        self.page, self.pending, self.expressions = page, None, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def send(self, data):
+        import json
+        message = json.loads(data)
+        method, params = message["method"], message["params"]
+        if method == "Page.getFrameTree":
+            result = {"frameTree": {"frame": {"id": "main", "url": self.page["url"]},
+                                    "childFrames": [{"frame": {"id": f["id"], "url": f["url"]}} for f in self.page.get("frames", [])]}}
+        elif method == "Page.createIsolatedWorld":
+            result = {"executionContextId": params["frameId"]}
+        elif method == "Runtime.evaluate":
+            self.expressions.append((params["contextId"], params["expression"]))
+            if params["expression"] == "document.visibilityState":
+                result = {"result": {"value": self.page.get("visibility", "visible")}}
+            else:
+                result = {"result": {"value": self.page["fill_result"](params["contextId"])}}
+        else:
+            result = {}
+        self.pending = json.dumps({"id": message["id"], "result": result})
+
+    def recv(self, timeout=None):
+        return self.pending
+
+
+def _filler(monkeypatch, pages):
+    executor = object.__new__(service.NativeBrowserExecutor)
+    executor.lock = __import__("threading").RLock()
+    executor.pages = lambda: [{"url": p["url"], "webSocketDebuggerUrl": "ws://page/" + str(i)} for i, p in enumerate(pages)]
+    sockets = {}
+    def connect(url, **_):
+        index = int(url.rsplit("/", 1)[1])
+        return sockets.setdefault(index, _Ws(pages[index]))
+    monkeypatch.setattr(service, "connect", connect)
+    return executor, sockets
+
+
+def test_fill_card_types_only_into_the_visible_page_on_the_approved_host(monkeypatch):
+    page = {"url": "https://pay.shop.example.ch/checkout", "fill_result": lambda ctx: {"filled": ["number", "cvc", "name", "expiry"]},
+            "frames": [{"id": "stripe", "url": "https://js.stripe.com/v3/elements"}]}
+    executor, sockets = _filler(monkeypatch, [page])
+    assert executor.fill_card("shop.example.ch", FIELDS) == {"filled": ["number", "expiry", "cvc", "name"], "missing": []}
+    typed = [e for e in sockets[0].expressions if e[1] != "document.visibilityState"]
+    # The main frame was typed into; the payment iframe on another host was not.
+    assert [ctx for ctx, _ in typed] == ["main"]
+    assert "4242424242424242" in typed[0][1] and '"shop.example.ch"' in typed[0][1]
+
+
+def test_fill_card_refuses_a_page_on_another_host_and_types_nothing(monkeypatch):
+    page = {"url": "https://shop.example.ch.evil.example/checkout", "fill_result": lambda ctx: {"filled": ["number"]}}
+    executor, sockets = _filler(monkeypatch, [page])
+    with pytest.raises(BrowserBoundaryError, match="host_mismatch"):
+        executor.fill_card("shop.example.ch", FIELDS)
+    assert all(e[1] == "document.visibilityState" for e in sockets[0].expressions)
+
+
+def test_fill_card_refuses_plain_http_and_credentials_in_the_url(monkeypatch):
+    for url in ("http://shop.example.ch/checkout", "https://user:pw@shop.example.ch/checkout"):
+        executor, sockets = _filler(monkeypatch, [{"url": url, "fill_result": lambda ctx: {"filled": ["number"]}}])
+        with pytest.raises(BrowserBoundaryError, match="host_mismatch"):
+            executor.fill_card("shop.example.ch", FIELDS)
+        assert all(e[1] == "document.visibilityState" for e in sockets[0].expressions)
+
+
+def test_fill_card_page_side_host_recheck_stops_a_redirect_race(monkeypatch):
+    page = {"url": "https://shop.example.ch/checkout", "fill_result": lambda ctx: {"host_mismatch": True}}
+    executor, _ = _filler(monkeypatch, [page])
+    with pytest.raises(BrowserBoundaryError, match="host_mismatch"):
+        executor.fill_card("shop.example.ch", FIELDS)
+
+
+def test_fill_card_ignores_a_background_tab_and_needs_a_visible_one(monkeypatch):
+    hidden = {"url": "https://shop.example.ch/checkout", "visibility": "hidden", "fill_result": lambda ctx: {"filled": ["number"]}}
+    executor, sockets = _filler(monkeypatch, [hidden])
+    with pytest.raises(BrowserBoundaryError, match="no_visible_page"):
+        executor.fill_card("shop.example.ch", FIELDS)
+    assert all(e[1] == "document.visibilityState" for e in sockets[0].expressions)
+
+
+def test_fill_card_reports_missing_fields_by_name_only(monkeypatch):
+    page = {"url": "https://shop.example.ch/checkout", "fill_result": lambda ctx: {"filled": ["number"]}}
+    executor, _ = _filler(monkeypatch, [page])
+    result = executor.fill_card("shop.example.ch", FIELDS)
+    assert result == {"filled": ["number"], "missing": ["expiry", "cvc", "name"]}
+    assert "4242" not in repr(result)
+
+
+@pytest.mark.parametrize("host", ["", "localhost", "10.0.0.1", "shop", "a b.example", "-x.example.ch", None, 5])
+def test_fill_card_needs_a_plain_dns_host(monkeypatch, host):
+    executor, _ = _filler(monkeypatch, [])
+    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+        executor.fill_card(host, FIELDS)
+
+
+def test_service_connects_the_filler_to_the_native_boundary(monkeypatch):
+    source = __import__("inspect").getsource(service.run)
+    assert 'boundary.card_fill = getattr(executor, "fill_card", None)' in source
