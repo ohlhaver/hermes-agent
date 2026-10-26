@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import socket
 import struct
@@ -106,6 +107,230 @@ def clear_remote_clipboard(socket_path):
                 continue
             raise BrowserBoundaryError("unsafe_return")
         raise BrowserBoundaryError("unsafe_return")
+
+CARD_FIELD_NAMES = frozenset({"number", "expiry", "cvc", "name"})
+
+
+# Shared-hosting and public suffixes: a card is never typed for "an approved host" that
+# anybody can register a subdomain under. Mirrors packages/core payment-card.ts in
+# hey-hermes (sharedSuffixes); the plane refuses them at approval too.
+CARD_SHARED_SUFFIXES = frozenset({
+    "github.io", "gitlab.io", "vercel.app", "netlify.app", "netlify.com", "pages.dev", "workers.dev", "web.app", "firebaseapp.com",
+    "herokuapp.com", "azurewebsites.net", "cloudfront.net", "appspot.com", "blogspot.com", "myshopify.com", "wixsite.com",
+    "weebly.com", "wordpress.com", "squarespace.com", "onrender.com", "fly.dev", "railway.app", "repl.co", "glitch.me",
+    "ngrok.io", "ngrok-free.app", "s3.amazonaws.com", "amazonaws.com", "cloudflare.net", "trycloudflare.com", "framer.app",
+    "bubbleapps.io", "webflow.io", "gitbook.io", "notion.site", "carrd.co", "000webhostapp.com", "surge.sh", "now.sh",
+    "deno.dev", "pythonanywhere.com", "ondigitalocean.app", "run.app", "cloudapp.net", "azurestaticapps.net",
+    "elasticbeanstalk.com", "blob.core.windows.net", "r2.dev", "supabase.co", "godaddysites.com", "mystrikingly.com",
+    "square.site", "wixstudio.io", "tumblr.com", "myftp.org", "duckdns.org", "no-ip.org", "dyndns.org",
+})
+_SECOND_LEVEL = frozenset({"co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go"})
+
+
+def _is_public_suffix(host):
+    labels = host.split(".")
+    return (host in CARD_SHARED_SUFFIXES
+            or (len(labels) == 2 and labels[0] in _SECOND_LEVEL and len(labels[1]) == 2))
+
+
+def _card_host(value):
+    """Approved merchant host: a plain DNS name, nothing else may receive a card."""
+    if not isinstance(value, str):
+        return None
+    host = value.strip().lower().rstrip(".")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    labels = host.split(".")
+    if (len(host) > 253 or len(labels) < 2 or any(not 0 < len(l) <= 63 or l.startswith("-") or l.endswith("-")
+            or not all(c.isalnum() or c == "-" for c in l) for l in labels)):
+        return None
+    if _is_public_suffix(host):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        return host
+
+
+def _card_url_matches(url, host):
+    """True for an https URL on the approved host or one of its subdomains."""
+    try:
+        target = urlsplit(url)
+        page = (target.hostname or "").lower().rstrip(".")
+        return (target.scheme == "https" and target.username is None and target.password is None
+                and (page == host or page.endswith("." + host)))
+    except ValueError:
+        return False
+
+
+_TEXTBOX_VALUE = re.compile(r"(?m)^(\s*(?:- )?(?:textbox|spinbutton|searchbox|combobox)\b[^\n]*?\]): .*$")
+_DIGIT_RUN = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+
+
+def _luhn(digits):
+    total, flip = 0, False
+    for char in reversed(digits):
+        number = int(char)
+        if flip:
+            number = number * 2 - 9 if number > 4 else number * 2
+        total += number
+        flip = not flip
+    return total % 10 == 0
+
+
+def _mask_card_text(text, typed):
+    """Hide what was typed from the agent's next observations.
+
+    The agent's snapshot lists the value of every text field, so a typed number
+    would come straight back to the model. Field values are hidden, the typed
+    strings are replaced wherever they appear, and any Luhn-valid card number is
+    hidden too, until a human hand-back has emptied the inputs. This keeps an
+    honest page's echo of the card from the model; it is no defence against a
+    page that disguises or re-encodes it, which is why the card is only ever
+    typed on an approved, non-shared merchant host.
+    """
+    text = _TEXTBOX_VALUE.sub(r"\1: [hidden]", text)
+    for secret in typed.get("strings", ()):
+        if len(secret) >= 3:
+            text = text.replace(secret, "[hidden]")
+    for number in typed.get("numbers", ()):
+        loose = r"[ -]?".join(re.escape(char) for char in number)
+        text = re.sub(loose, "[hidden]", text)
+    text = _DIGIT_RUN.sub(lambda m: "[hidden]" if _luhn(re.sub(r"\D", "", m.group(0))) else m.group(0), text)
+    for cvc in typed.get("cvcs", ()):
+        text = re.sub(r'(?m)^(\s*(?:- )?StaticText) "%s"$' % re.escape(cvc), r'\1 "[hidden]"', text)
+    return text
+
+
+def _mask_card_value(value, typed):
+    if isinstance(value, str):
+        return _mask_card_text(value, typed)
+    if isinstance(value, list):
+        return [_mask_card_value(item, typed) for item in value]
+    if isinstance(value, dict):
+        return {key: "[hidden]" if key == "value" and isinstance(item, str) else _mask_card_value(item, typed)
+                for key, item in value.items()}
+    return value
+
+
+class _Cdp:
+    def __init__(self, ws):
+        self.ws, self.seq = ws, 0
+
+    def call(self, method, params=None):
+        self.seq += 1
+        self.ws.send(json.dumps({"id": self.seq, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = json.loads(self.ws.recv(timeout=max(.01, deadline - time.monotonic())))
+            if result.get("id") == self.seq:
+                if "error" in result:
+                    raise BrowserBoundaryError("card_fill_failed")
+                return result.get("result", {})
+        raise BrowserBoundaryError("card_fill_failed")
+
+
+# HPD-1722: typed into the page by the broker, never by a process the model can
+# reach. Runs in an isolated world (page scripts cannot override the setters or
+# read the arguments); the host is checked again here, at the moment of typing.
+CARD_FILL_JS = r"""((approvedHost, values) => {
+  const host = location.hostname.toLowerCase().replace(/\.$/, '');
+  if (location.protocol !== 'https:' || !(host === approvedHost || host.endsWith('.' + approvedHost))) return {host_mismatch: true};
+  const setters = {
+    input: Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set,
+    textarea: Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set,
+    select: Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set,
+  };
+  const pattern = {
+    number: /(card.?(number|no\b|num)|cc.?(num|number)|kartennummer|karten-nr|num[eé]ro de carte|n[uú]mero de tarjeta|numero carta)/i,
+    expiry: /(expir|exp\.?\s?date|mm\s*\/\s*(yy|jj|aa)|g[uü]ltig|valid (thru|until)|ablauf|date d.expiration)/i,
+    cvc: /(cvc|cvv|csc|security.?code|verification.?(code|number)|pr[uü]fziffer|sicherheitscode|code de s[eé]curit)/i,
+    name: /(name on card|card.?holder|cardholder|karteninhaber|inhaber|titulaire|titular)/i,
+    month: /(month|monat|mois|\bmes\b|mese|\bmm\b)/i,
+    year: /(year|jahr|ann[eé]e|a[nñ]o|anno|\byy(yy)?\b|\bjj\b)/i,
+  };
+  const roots = [document];
+  const inputs = [];
+  const selects = [];
+  for (let i = 0; i < roots.length; i++) {
+    for (const el of roots[i].querySelectorAll('*')) {
+      if (el.shadowRoot) roots.push(el.shadowRoot);
+      if (el instanceof HTMLInputElement && !['checkbox','radio','button','submit','file','hidden','image','reset'].includes(el.type)) inputs.push(el);
+      if (el instanceof HTMLSelectElement) selects.push(el);
+    }
+  }
+  const visible = (el) => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return !el.disabled && !el.readOnly && r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const label = (el) => {
+    const parts = [el.name, el.id, el.placeholder, el.getAttribute('aria-label')];
+    if (el.labels) for (const l of el.labels) parts.push(l.textContent);
+    const by = el.getAttribute('aria-labelledby');
+    if (by) for (const id of by.split(/\s+/)) { const n = document.getElementById(id); if (n) parts.push(n.textContent); }
+    return parts.filter(Boolean).join(' ');
+  };
+  const byAuto = (token, list = inputs) => list.find((el) => visible(el) && (el.autocomplete || '').split(/\s+/).includes(token));
+  const byText = (field) => inputs.find((el) => {
+    if (!visible(el)) return false;
+    const text = label(el);
+    if (!pattern[field].test(text)) return false;
+    return field === 'cvc' || field === 'expiry' || !pattern.cvc.test(text);
+  });
+  const put = (el, value) => {
+    el.focus();
+    (el instanceof HTMLTextAreaElement ? setters.textarea : setters.input).call(el, value);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.blur();
+  };
+  const choose = (el, wanted) => {
+    const same = (text) => wanted.some((w) => text === w || new RegExp('^0*' + w.replace(/^0+/, '') + '(\\D|$)').test(text) || (w.length === 4 && text.endsWith(w)));
+    for (const option of el.options) {
+      if (same((option.value || '').trim()) || same((option.text || '').trim())) {
+        el.focus();
+        setters.select.call(el, option.value);
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        el.blur();
+        return true;
+      }
+    }
+    return false;
+  };
+  const filled = [];
+  const targets = {
+    number: byAuto('cc-number') || byText('number'),
+    cvc: byAuto('cc-csc') || byText('cvc'),
+    name: byAuto('cc-name') || byText('name'),
+  };
+  for (const field of ['number', 'cvc', 'name']) {
+    if (targets[field] && values[field]) { put(targets[field], values[field]); filled.push(field); }
+  }
+  if (values.expiry) {
+    const [mm, yy] = values.expiry.split('/');
+    const yyyy = (values.expiry_long || '').split('/')[1] || '20' + yy;
+    const combined = byAuto('cc-exp');
+    const anyMonth = byAuto('cc-exp-month') || byAuto('cc-exp-month', selects) || selects.find((el) => visible(el) && pattern.month.test(label(el)) && !pattern.year.test(label(el)));
+    const anyYear = byAuto('cc-exp-year') || byAuto('cc-exp-year', selects) || selects.find((el) => visible(el) && pattern.year.test(label(el)) && !pattern.month.test(label(el)));
+    if (combined) {
+      const wide = (combined.maxLength || 0) >= 7;
+      put(combined, wide && values.expiry_long ? values.expiry_long : values.expiry);
+      filled.push('expiry');
+    } else if (anyMonth && anyYear) {
+      const okMonth = anyMonth instanceof HTMLSelectElement ? choose(anyMonth, [mm, String(Number(mm))]) : (put(anyMonth, mm), true);
+      const okYear = anyYear instanceof HTMLSelectElement ? choose(anyYear, [yyyy, yy]) : (put(anyYear, (anyYear.maxLength || 0) === 4 ? yyyy : yy), true);
+      if (okMonth && okYear) filled.push('expiry');
+    } else {
+      const other = byText('expiry');
+      if (other) { put(other, values.expiry); filled.push('expiry'); }
+    }
+  }
+  return {filled};
+})"""
 
 
 class NativeBrowserExecutor:
@@ -204,7 +429,88 @@ class NativeBrowserExecutor:
             if command == "eval" and args == ["window.location.href"] and isinstance(data, dict):
                 if isinstance(data.get("result"), str):
                     data["result"] = public_url(data["result"])
+            result = self._mask_typed_card(result)
             return json.loads(redact_sensitive_text(json.dumps(result), force=True))
+
+    def _mask_typed_card(self, result):
+        typed = getattr(self, "_card_typed", None)
+        if not typed:
+            return result
+        return _mask_card_value(result, typed)
+
+
+    def fill_card(self, approved_host, fields):
+        """Type one approved payment's card into the visible page. Names only come back.
+
+        The host check uses the page's real URL read from the browser here, never
+        a value the caller supplies. Only the visible tab and its same-host frames
+        are typed into; a frame on another host (a payment iframe) is left alone.
+        """
+        host = _card_host(approved_host)
+        if host is None:
+            raise BrowserBoundaryError("command_denied")
+        values = {key: fields[key] for key in fields}
+        # What the agent must not read back afterwards (see _mask_card_text); set
+        # before typing so no observation can slip between the fill and the mask.
+        with self.lock:
+            # Added to what an earlier fill left in the page, never replacing it. The mask
+            # ends only when a human hand-back has emptied every input (safe_return).
+            previous = getattr(self, "_card_typed", None) or {"numbers": (), "cvcs": (), "strings": ()}
+            self._card_typed = {
+                "numbers": previous["numbers"] + ((values["number"],) if values.get("number") else ()),
+                "cvcs": previous["cvcs"] + ((values["cvc"],) if values.get("cvc") else ()),
+                "strings": previous["strings"] + tuple(v for k, v in values.items() if k in ("name", "expiry", "expiry_long")),
+            }
+        with self.lock:
+            targets = []
+            for page in self.pages():
+                url = page.get("url", "")
+                if url == "about:blank":
+                    continue
+                if not page.get("webSocketDebuggerUrl"):
+                    continue
+                targets.append(page)
+            filled, seen_visible, mismatch = set(), False, False
+            for page in targets:
+                with connect(page["webSocketDebuggerUrl"], open_timeout=3, max_size=2 * 1024 * 1024) as ws:
+                    cdp = _Cdp(ws)
+                    tree = cdp.call("Page.getFrameTree")["frameTree"]
+                    main_world = cdp.call("Page.createIsolatedWorld", {"frameId": tree["frame"]["id"],
+                                                                       "worldName": "hermes-private-card"})["executionContextId"]
+                    state = cdp.call("Runtime.evaluate", {"contextId": main_world, "returnByValue": True,
+                                                         "expression": "document.visibilityState"})
+                    if state.get("result", {}).get("value") != "visible":
+                        continue
+                    seen_visible = True
+                    frames = [tree]
+                    for frame in frames:
+                        frames.extend(frame.get("childFrames", []))
+                        info = frame["frame"]
+                        if not _card_url_matches(info.get("url", ""), host):
+                            if info["id"] == tree["frame"]["id"]:
+                                mismatch = True
+                                break
+                            continue
+                        ctx = cdp.call("Page.createIsolatedWorld", {"frameId": info["id"],
+                                                                    "worldName": "hermes-private-card"})["executionContextId"]
+                        outcome = cdp.call("Runtime.evaluate", {
+                            "contextId": ctx, "returnByValue": True,
+                            "expression": CARD_FILL_JS + "(" + json.dumps(host) + "," + json.dumps(values) + ")"})
+                        value = outcome.get("result", {}).get("value")
+                        if outcome.get("exceptionDetails") or not isinstance(value, dict):
+                            continue
+                        if value.get("host_mismatch"):
+                            mismatch = True
+                            break
+                        filled.update(name for name in value.get("filled", []) if name in CARD_FIELD_NAMES)
+                    break  # Only the one visible (focused) tab is ever typed into.
+            values.clear()
+        if mismatch and not filled:
+            raise BrowserBoundaryError("host_mismatch")
+        if not seen_visible:
+            raise BrowserBoundaryError("no_visible_page")
+        order = ("number", "expiry", "cvc", "name")
+        return {"filled": [n for n in order if n in filled], "missing": [n for n in order if n not in filled]}
 
     def safe_return(self):
         # Runs only after input is fenced, under the broker's human lease.
@@ -246,7 +552,10 @@ class NativeBrowserExecutor:
                                                                 "returnByValue": True})
                             if cleaned.get("exceptionDetails") or cleaned.get("result", {}).get("value") is not True:
                                 return False
-                return bool(self.pages())
+                cleared = bool(self.pages())
+                if cleared:
+                    self._card_typed = None  # Every input was emptied above; nothing left to hide.
+                return cleared
         except Exception:
             return False
 
@@ -278,6 +587,7 @@ async def run(manifest, *, trusted_url_validator: Callable[[str], bool] | None =
     boundary = NativeSessionBoundary(lease, executor.execute, executor.safe_return,
         agent_uid=manifest["agent_uid"], management_uid=manifest["management_uid"],
         session_id=manifest["session_id"], expires_at=manifest["expires_at"], takeover_href=manifest.get("takeover_href"))
+    boundary.card_fill = getattr(executor, "fill_card", None)
     viewer = boundary.viewer = NativeRfbViewer(boundary, runtime.rfb_socket_path())
     servers = []
     running_servers = []
