@@ -360,3 +360,41 @@ def test_fill_card_needs_a_plain_dns_host(monkeypatch, host):
 def test_service_connects_the_filler_to_the_native_boundary(monkeypatch):
     source = __import__("inspect").getsource(service.run)
     assert 'boundary.card_fill = getattr(executor, "fill_card", None)' in source
+
+
+SNAPSHOT = ('- textbox "Card number" [ref=e1]: 4242424242424242\n- textbox "Security code (CVC)" [ref=e2]: 987\n'
+            '- textbox "Name on card" [ref=e3]: Max Muster\n  - StaticText "4242424242424242"\n  - StaticText "987"\n'
+            '- text: Total CHF 987.00\n- text: Paid with 4242 4242 4242 4242 and again 4242-4242-4242-4242\n'
+            '- textbox "Coupon" [ref=e4]: SAVE10\n')
+
+
+def test_agent_snapshot_after_typing_hides_what_was_typed(executor_factory, monkeypatch):
+    executor, calls = executor_factory(lambda _: True)
+    monkeypatch.setattr(bt, "_run_browser_command", lambda sid, command, args: {"success": True, "data": {"snapshot": SNAPSHOT}})
+    before = executor.execute("snapshot", [])
+    assert "4242424242424242" in before["data"]["snapshot"]  # nothing hidden before a fill
+    fields = {"number": "4242424242424242", "expiry": "12/28", "expiry_long": "12/2028", "cvc": "987", "name": "Max Muster"}
+    monkeypatch.setattr(service, "connect", lambda *_a, **_k: _Ws({"url": "https://shop.example.ch/", "fill_result": lambda ctx: {"filled": ["number", "cvc"]}}))
+    executor.pages = lambda: [{"url": "https://shop.example.ch/", "webSocketDebuggerUrl": "ws://page/0"}]
+    executor.fill_card("shop.example.ch", fields)
+    after = executor.execute("snapshot", [])["data"]["snapshot"]
+    for secret in ("4242424242424242", "4242 4242 4242 4242", "4242-4242-4242-4242", "Max Muster", "SAVE10"):
+        assert secret not in after
+    assert "Total CHF 987.00" in after  # a price that looks like the CVC stays readable
+    assert 'StaticText "[hidden]"' in after
+
+
+def test_card_mask_ends_after_a_human_handback_or_its_time(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda _: True)
+    monkeypatch.setattr(bt, "_run_browser_command", lambda sid, command, args: {"success": True, "data": {"snapshot": SNAPSHOT}})
+    executor._card_typed = {"until": time.monotonic() + 60, "number": "4242424242424242", "cvc": "987", "strings": ("Max Muster",)}
+    assert "SAVE10" not in executor.execute("snapshot", [])["data"]["snapshot"]
+    executor._card_typed["until"] = time.monotonic() - 1
+    assert "SAVE10" in executor.execute("snapshot", [])["data"]["snapshot"]
+    assert executor._card_typed is None
+
+
+def test_luhn_valid_numbers_are_hidden_even_if_not_the_typed_one():
+    typed = {"until": time.monotonic() + 60, "number": "", "cvc": "", "strings": ()}
+    masked = service._mask_card_text("order 4111 1111 1111 1111 ref 1234567890123", typed)
+    assert "4111" not in masked and "1234567890123" in masked

@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import socket
 import struct
@@ -141,6 +142,55 @@ def _card_url_matches(url, host):
         return False
 
 
+CARD_MASK_SECONDS = 600
+_TEXTBOX_VALUE = re.compile(r"(?m)^(\s*(?:- )?(?:textbox|spinbutton|searchbox|combobox)\b[^\n]*?\]): .*$")
+_DIGIT_RUN = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+
+
+def _luhn(digits):
+    total, flip = 0, False
+    for char in reversed(digits):
+        number = int(char)
+        if flip:
+            number = number * 2 - 9 if number > 4 else number * 2
+        total += number
+        flip = not flip
+    return total % 10 == 0
+
+
+def _mask_card_text(text, typed):
+    """Hide what was typed from the agent's next observations.
+
+    The agent's snapshot lists the value of every text field, so a typed number
+    would come straight back to the model. Field values are hidden, the typed
+    strings are replaced wherever they appear, and any Luhn-valid card number is
+    hidden too, until the mask runs out or a human hands the browser back.
+    """
+    text = _TEXTBOX_VALUE.sub(r"\1: [hidden]", text)
+    for secret in typed.get("strings", ()):
+        if len(secret) >= 4:
+            text = text.replace(secret, "[hidden]")
+    number = typed.get("number") or ""
+    if number:
+        loose = r"[ -]?".join(re.escape(char) for char in number)
+        text = re.sub(loose, "[hidden]", text)
+    text = _DIGIT_RUN.sub(lambda m: "[hidden]" if _luhn(re.sub(r"\D", "", m.group(0))) else m.group(0), text)
+    cvc = typed.get("cvc") or ""
+    if cvc:
+        text = re.sub(r'(?m)^(\s*(?:- )?StaticText) "%s"$' % re.escape(cvc), r'\1 "[hidden]"', text)
+    return text
+
+
+def _mask_card_value(value, typed):
+    if isinstance(value, str):
+        return _mask_card_text(value, typed)
+    if isinstance(value, list):
+        return [_mask_card_value(item, typed) for item in value]
+    if isinstance(value, dict):
+        return {key: _mask_card_value(item, typed) for key, item in value.items()}
+    return value
+
+
 class _Cdp:
     def __init__(self, ws):
         self.ws, self.seq = ws, 0
@@ -163,23 +213,28 @@ class _Cdp:
 # read the arguments); the host is checked again here, at the moment of typing.
 CARD_FILL_JS = r"""((approvedHost, values) => {
   const host = location.hostname.toLowerCase().replace(/\.$/, '');
-  if (!(host === approvedHost || host.endsWith('.' + approvedHost))) return {host_mismatch: true};
+  if (location.protocol !== 'https:' || !(host === approvedHost || host.endsWith('.' + approvedHost))) return {host_mismatch: true};
   const setters = {
     input: Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set,
     textarea: Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set,
+    select: Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set,
   };
   const pattern = {
     number: /(card.?(number|no\b|num)|cc.?(num|number)|kartennummer|karten-nr|num[eé]ro de carte|n[uú]mero de tarjeta|numero carta)/i,
     expiry: /(expir|exp\.?\s?date|mm\s*\/\s*(yy|jj|aa)|g[uü]ltig|valid (thru|until)|ablauf|date d.expiration)/i,
     cvc: /(cvc|cvv|csc|security.?code|verification.?(code|number)|pr[uü]fziffer|sicherheitscode|code de s[eé]curit)/i,
     name: /(name on card|card.?holder|cardholder|karteninhaber|inhaber|titulaire|titular)/i,
+    month: /(month|monat|mois|\bmes\b|mese|\bmm\b)/i,
+    year: /(year|jahr|ann[eé]e|a[nñ]o|anno|\byy(yy)?\b|\bjj\b)/i,
   };
   const roots = [document];
   const inputs = [];
+  const selects = [];
   for (let i = 0; i < roots.length; i++) {
     for (const el of roots[i].querySelectorAll('*')) {
       if (el.shadowRoot) roots.push(el.shadowRoot);
       if (el instanceof HTMLInputElement && !['checkbox','radio','button','submit','file','hidden','image','reset'].includes(el.type)) inputs.push(el);
+      if (el instanceof HTMLSelectElement) selects.push(el);
     }
   }
   const visible = (el) => {
@@ -193,7 +248,7 @@ CARD_FILL_JS = r"""((approvedHost, values) => {
     if (by) for (const id of by.split(/\s+/)) { const n = document.getElementById(id); if (n) parts.push(n.textContent); }
     return parts.filter(Boolean).join(' ');
   };
-  const byAuto = (token) => inputs.find((el) => visible(el) && (el.autocomplete || '').split(/\s+/).includes(token));
+  const byAuto = (token, list = inputs) => list.find((el) => visible(el) && (el.autocomplete || '').split(/\s+/).includes(token));
   const byText = (field) => inputs.find((el) => {
     if (!visible(el)) return false;
     const text = label(el);
@@ -207,27 +262,43 @@ CARD_FILL_JS = r"""((approvedHost, values) => {
     el.dispatchEvent(new Event('change', {bubbles: true}));
     el.blur();
   };
+  const choose = (el, wanted) => {
+    const same = (text) => wanted.some((w) => text === w || new RegExp('^0*' + w.replace(/^0+/, '') + '(\\D|$)').test(text) || (w.length === 4 && text.endsWith(w)));
+    for (const option of el.options) {
+      if (same((option.value || '').trim()) || same((option.text || '').trim())) {
+        el.focus();
+        setters.select.call(el, option.value);
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        el.blur();
+        return true;
+      }
+    }
+    return false;
+  };
   const filled = [];
   const targets = {
     number: byAuto('cc-number') || byText('number'),
     cvc: byAuto('cc-csc') || byText('cvc'),
     name: byAuto('cc-name') || byText('name'),
   };
-  const combined = byAuto('cc-exp') || null;
-  const month = byAuto('cc-exp-month'), year = byAuto('cc-exp-year');
   for (const field of ['number', 'cvc', 'name']) {
     if (targets[field] && values[field]) { put(targets[field], values[field]); filled.push(field); }
   }
   if (values.expiry) {
+    const [mm, yy] = values.expiry.split('/');
+    const yyyy = (values.expiry_long || '').split('/')[1] || '20' + yy;
+    const combined = byAuto('cc-exp');
+    const anyMonth = byAuto('cc-exp-month') || byAuto('cc-exp-month', selects) || selects.find((el) => visible(el) && pattern.month.test(label(el)) && !pattern.year.test(label(el)));
+    const anyYear = byAuto('cc-exp-year') || byAuto('cc-exp-year', selects) || selects.find((el) => visible(el) && pattern.year.test(label(el)) && !pattern.month.test(label(el)));
     if (combined) {
       const wide = (combined.maxLength || 0) >= 7;
       put(combined, wide && values.expiry_long ? values.expiry_long : values.expiry);
       filled.push('expiry');
-    } else if (month && year) {
-      const [mm, yy] = values.expiry.split('/');
-      put(month, mm);
-      put(year, (year.maxLength || 0) === 4 && values.expiry_long ? values.expiry_long.split('/')[1] : yy);
-      filled.push('expiry');
+    } else if (anyMonth && anyYear) {
+      const okMonth = anyMonth instanceof HTMLSelectElement ? choose(anyMonth, [mm, String(Number(mm))]) : (put(anyMonth, mm), true);
+      const okYear = anyYear instanceof HTMLSelectElement ? choose(anyYear, [yyyy, yy]) : (put(anyYear, (anyYear.maxLength || 0) === 4 ? yyyy : yy), true);
+      if (okMonth && okYear) filled.push('expiry');
     } else {
       const other = byText('expiry');
       if (other) { put(other, values.expiry); filled.push('expiry'); }
@@ -333,7 +404,18 @@ class NativeBrowserExecutor:
             if command == "eval" and args == ["window.location.href"] and isinstance(data, dict):
                 if isinstance(data.get("result"), str):
                     data["result"] = public_url(data["result"])
+            result = self._mask_typed_card(result)
             return json.loads(redact_sensitive_text(json.dumps(result), force=True))
+
+    def _mask_typed_card(self, result):
+        typed = getattr(self, "_card_typed", None)
+        if not typed:
+            return result
+        if time.monotonic() >= typed["until"]:
+            self._card_typed = None
+            return result
+        return _mask_card_value(result, typed)
+
 
     def fill_card(self, approved_host, fields):
         """Type one approved payment's card into the visible page. Names only come back.
@@ -346,6 +428,12 @@ class NativeBrowserExecutor:
         if host is None:
             raise BrowserBoundaryError("command_denied")
         values = {key: fields[key] for key in fields}
+        # What the agent must not read back afterwards (see _mask_card_text); set
+        # before typing so no observation can slip between the fill and the mask.
+        with self.lock:
+            self._card_typed = {"until": time.monotonic() + CARD_MASK_SECONDS, "number": values.get("number", ""),
+                                "cvc": values.get("cvc", ""),
+                                "strings": tuple(v for k, v in values.items() if k in ("name", "expiry", "expiry_long"))}
         with self.lock:
             targets = []
             for page in self.pages():
@@ -388,6 +476,7 @@ class NativeBrowserExecutor:
                             mismatch = True
                             break
                         filled.update(name for name in value.get("filled", []) if name in CARD_FIELD_NAMES)
+                    break  # Only the one visible (focused) tab is ever typed into.
             values.clear()
         if mismatch and not filled:
             raise BrowserBoundaryError("host_mismatch")
@@ -436,7 +525,10 @@ class NativeBrowserExecutor:
                                                                 "returnByValue": True})
                             if cleaned.get("exceptionDetails") or cleaned.get("result", {}).get("value") is not True:
                                 return False
-                return bool(self.pages())
+                cleared = bool(self.pages())
+                if cleared:
+                    self._card_typed = None  # Every input was emptied above; nothing left to hide.
+                return cleared
         except Exception:
             return False
 
