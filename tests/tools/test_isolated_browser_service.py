@@ -384,17 +384,41 @@ def test_agent_snapshot_after_typing_hides_what_was_typed(executor_factory, monk
     assert 'StaticText "[hidden]"' in after
 
 
-def test_card_mask_ends_after_a_human_handback_or_its_time(executor_factory, monkeypatch):
+def test_card_mask_has_no_timeout(executor_factory, monkeypatch):
     executor, _ = executor_factory(lambda _: True)
     monkeypatch.setattr(bt, "_run_browser_command", lambda sid, command, args: {"success": True, "data": {"snapshot": SNAPSHOT}})
-    executor._card_typed = {"until": time.monotonic() + 60, "number": "4242424242424242", "cvc": "987", "strings": ("Max Muster",)}
+    executor._card_typed = {"numbers": ("4242424242424242",), "cvcs": ("987",), "strings": ("Max Muster",)}
     assert "SAVE10" not in executor.execute("snapshot", [])["data"]["snapshot"]
-    executor._card_typed["until"] = time.monotonic() - 1
-    assert "SAVE10" in executor.execute("snapshot", [])["data"]["snapshot"]
-    assert executor._card_typed is None
+    # No timeout: the values stay in the page until a human hand-back empties it.
+    monkeypatch.setattr(service.time, "monotonic", lambda: 10 ** 9)
+    assert "SAVE10" not in executor.execute("snapshot", [])["data"]["snapshot"]
+    monkeypatch.undo()
 
 
 def test_luhn_valid_numbers_are_hidden_even_if_not_the_typed_one():
-    typed = {"until": time.monotonic() + 60, "number": "", "cvc": "", "strings": ()}
+    typed = {"numbers": (), "cvcs": (), "strings": ()}
     masked = service._mask_card_text("order 4111 1111 1111 1111 ref 1234567890123", typed)
     assert "4111" not in masked and "1234567890123" in masked
+
+
+def test_a_second_fill_adds_to_the_mask_and_value_keys_are_hidden(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda _: True)
+    monkeypatch.setattr(service, "connect", lambda *_a, **_k: _Ws({"url": "https://shop.example.ch/", "fill_result": lambda ctx: {"filled": ["number"]}}))
+    executor.pages = lambda: [{"url": "https://shop.example.ch/", "webSocketDebuggerUrl": "ws://page/0"}]
+    executor.fill_card("shop.example.ch", {"number": "4111111111111111", "cvc": "321", "name": "Anna Beispiel"})
+    executor.fill_card("shop.example.ch", {"number": "4242424242424242", "cvc": "987", "name": "Max Muster"})
+    assert set(executor._card_typed["numbers"]) == {"4111111111111111", "4242424242424242"}
+    monkeypatch.setattr(bt, "_run_browser_command", lambda sid, c, a: {"success": True, "data": {
+        "snapshot": "- textbox [ref=e1]: Anna Beispiel 4111 1111 1111 1111", "refs": {"e1": {"role": "textbox", "value": "4242424242424242"}}}})
+    seen = executor.execute("snapshot", [])["data"]
+    assert "Anna" not in seen["snapshot"] and "4111" not in seen["snapshot"] and seen["refs"]["e1"]["value"] == "[hidden]"
+
+
+@pytest.mark.parametrize("host", ["github.io", "evil.vercel.app", "co.uk", "com.au", "x.co.uk"])
+def test_shared_hosting_and_public_suffixes_never_receive_a_card(monkeypatch, host):
+    executor, _ = _filler(monkeypatch, [{"url": "https://" + host + "/", "fill_result": lambda ctx: {"filled": ["number"]}}])
+    if host in ("evil.vercel.app", "x.co.uk"):
+        executor.fill_card(host, FIELDS)  # a merchant's own registrable name under a shared suffix is allowed
+        return
+    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+        executor.fill_card(host, FIELDS)

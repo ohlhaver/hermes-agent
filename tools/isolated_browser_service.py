@@ -111,6 +111,28 @@ def clear_remote_clipboard(socket_path):
 CARD_FIELD_NAMES = frozenset({"number", "expiry", "cvc", "name"})
 
 
+# Shared-hosting and public suffixes: a card is never typed for "an approved host" that
+# anybody can register a subdomain under. Mirrors packages/core payment-card.ts in
+# hey-hermes (sharedSuffixes); the plane refuses them at approval too.
+CARD_SHARED_SUFFIXES = frozenset({
+    "github.io", "gitlab.io", "vercel.app", "netlify.app", "netlify.com", "pages.dev", "workers.dev", "web.app", "firebaseapp.com",
+    "herokuapp.com", "azurewebsites.net", "cloudfront.net", "appspot.com", "blogspot.com", "myshopify.com", "wixsite.com",
+    "weebly.com", "wordpress.com", "squarespace.com", "onrender.com", "fly.dev", "railway.app", "repl.co", "glitch.me",
+    "ngrok.io", "ngrok-free.app", "s3.amazonaws.com", "amazonaws.com", "cloudflare.net", "trycloudflare.com", "framer.app",
+    "bubbleapps.io", "webflow.io", "gitbook.io", "notion.site", "carrd.co", "000webhostapp.com", "surge.sh", "now.sh",
+    "deno.dev", "pythonanywhere.com", "ondigitalocean.app", "run.app", "cloudapp.net", "azurestaticapps.net",
+    "elasticbeanstalk.com", "blob.core.windows.net", "r2.dev", "supabase.co", "godaddysites.com", "mystrikingly.com",
+    "square.site", "wixstudio.io", "tumblr.com", "myftp.org", "duckdns.org", "no-ip.org", "dyndns.org",
+})
+_SECOND_LEVEL = frozenset({"co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go"})
+
+
+def _is_public_suffix(host):
+    labels = host.split(".")
+    return (host in CARD_SHARED_SUFFIXES
+            or (len(labels) == 2 and labels[0] in _SECOND_LEVEL and len(labels[1]) == 2))
+
+
 def _card_host(value):
     """Approved merchant host: a plain DNS name, nothing else may receive a card."""
     if not isinstance(value, str):
@@ -123,6 +145,8 @@ def _card_host(value):
     labels = host.split(".")
     if (len(host) > 253 or len(labels) < 2 or any(not 0 < len(l) <= 63 or l.startswith("-") or l.endswith("-")
             or not all(c.isalnum() or c == "-" for c in l) for l in labels)):
+        return None
+    if _is_public_suffix(host):
         return None
     try:
         ipaddress.ip_address(host)
@@ -142,7 +166,6 @@ def _card_url_matches(url, host):
         return False
 
 
-CARD_MASK_SECONDS = 600
 _TEXTBOX_VALUE = re.compile(r"(?m)^(\s*(?:- )?(?:textbox|spinbutton|searchbox|combobox)\b[^\n]*?\]): .*$")
 _DIGIT_RUN = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 
@@ -164,19 +187,20 @@ def _mask_card_text(text, typed):
     The agent's snapshot lists the value of every text field, so a typed number
     would come straight back to the model. Field values are hidden, the typed
     strings are replaced wherever they appear, and any Luhn-valid card number is
-    hidden too, until the mask runs out or a human hands the browser back.
+    hidden too, until a human hand-back has emptied the inputs. This keeps an
+    honest page's echo of the card from the model; it is no defence against a
+    page that disguises or re-encodes it, which is why the card is only ever
+    typed on an approved, non-shared merchant host.
     """
     text = _TEXTBOX_VALUE.sub(r"\1: [hidden]", text)
     for secret in typed.get("strings", ()):
-        if len(secret) >= 4:
+        if len(secret) >= 3:
             text = text.replace(secret, "[hidden]")
-    number = typed.get("number") or ""
-    if number:
+    for number in typed.get("numbers", ()):
         loose = r"[ -]?".join(re.escape(char) for char in number)
         text = re.sub(loose, "[hidden]", text)
     text = _DIGIT_RUN.sub(lambda m: "[hidden]" if _luhn(re.sub(r"\D", "", m.group(0))) else m.group(0), text)
-    cvc = typed.get("cvc") or ""
-    if cvc:
+    for cvc in typed.get("cvcs", ()):
         text = re.sub(r'(?m)^(\s*(?:- )?StaticText) "%s"$' % re.escape(cvc), r'\1 "[hidden]"', text)
     return text
 
@@ -187,7 +211,8 @@ def _mask_card_value(value, typed):
     if isinstance(value, list):
         return [_mask_card_value(item, typed) for item in value]
     if isinstance(value, dict):
-        return {key: _mask_card_value(item, typed) for key, item in value.items()}
+        return {key: "[hidden]" if key == "value" and isinstance(item, str) else _mask_card_value(item, typed)
+                for key, item in value.items()}
     return value
 
 
@@ -411,9 +436,6 @@ class NativeBrowserExecutor:
         typed = getattr(self, "_card_typed", None)
         if not typed:
             return result
-        if time.monotonic() >= typed["until"]:
-            self._card_typed = None
-            return result
         return _mask_card_value(result, typed)
 
 
@@ -431,9 +453,14 @@ class NativeBrowserExecutor:
         # What the agent must not read back afterwards (see _mask_card_text); set
         # before typing so no observation can slip between the fill and the mask.
         with self.lock:
-            self._card_typed = {"until": time.monotonic() + CARD_MASK_SECONDS, "number": values.get("number", ""),
-                                "cvc": values.get("cvc", ""),
-                                "strings": tuple(v for k, v in values.items() if k in ("name", "expiry", "expiry_long"))}
+            # Added to what an earlier fill left in the page, never replacing it. The mask
+            # ends only when a human hand-back has emptied every input (safe_return).
+            previous = getattr(self, "_card_typed", None) or {"numbers": (), "cvcs": (), "strings": ()}
+            self._card_typed = {
+                "numbers": previous["numbers"] + ((values["number"],) if values.get("number") else ()),
+                "cvcs": previous["cvcs"] + ((values["cvc"],) if values.get("cvc") else ()),
+                "strings": previous["strings"] + tuple(v for k, v in values.items() if k in ("name", "expiry", "expiry_long")),
+            }
         with self.lock:
             targets = []
             for page in self.pages():
