@@ -52,9 +52,10 @@ def sanitize_tool_call_name(name: Any) -> str:
     Anything else has each run of disallowed characters replaced by ``_``,
     is trimmed of edge underscores and capped at 64 characters; a name with
     nothing usable left becomes ``invalid_tool_call``.  Only names the model
-    invented go down this path, so the result never collides with a real
-    tool by accident in a way that matters: the call is answered with an
-    "unknown tool" error either way.
+    invented go down this path.  The cleaned name may equal a real tool
+    (``"browser_click\n"`` -> ``"browser_click"``); that is harmless because
+    callers only use it for the stored/replayed copy — dispatch decides on
+    the original name and answers the call as an unknown tool.
     """
     if is_valid_tool_call_name(name):
         return name
