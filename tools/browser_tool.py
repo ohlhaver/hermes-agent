@@ -2974,16 +2974,20 @@ def _settle_isolated_snapshot(session_key, snap_result, title, final_url, respon
     def state(result):
         d = result.get("data", {}) or {}
         info = d.get("page_info") or {}
-        ct = str(info.get("content_type") or "")
-        error_doc = bool(ct) and "html" not in ct.lower()
+        ct = str(info.get("content_type") or "").lower()
         thin = len(d.get("refs", {}) or {}) < _ISOLATED_MIN_ELEMENTS
+        # A near-empty document that is not a web page (sbb.ch answers a wrong
+        # address with an XML AccessDenied). PDFs, images and media render in
+        # Chrome's own viewer and are real content.
+        error_doc = (thin and bool(ct) and "html" not in ct
+                     and not ct.startswith(("application/pdf", "image/", "video/", "audio/")))
         origin = d.get("origin") or ""
         elsewhere = bool(origin) and bool(final_url) and not _same_page(origin, final_url)
         return d, info, error_doc, thin, elsewhere
 
     d, info, error_doc, thin, elsewhere = state(snap_result)
     looks = 0
-    while time.monotonic() < deadline:
+    while time.monotonic() + _ISOLATED_SETTLE_SECONDS <= deadline:
         # One more look when the snapshot names another page (HPD-1798 guard);
         # up to the deadline while an untitled HTML page has not rendered; one
         # more look for a titled page that is still thin; none for an error
@@ -3001,11 +3005,13 @@ def _settle_isolated_snapshot(session_key, snap_result, title, final_url, respon
     if error_doc:
         text = _redact_browser_output(str(info.get("document_text") or ""))
         response["page_notice"] = (
-            "This address returned an error document instead of a web page"
-            + (f" ({text})" if text else "")
-            + ". The address is probably wrong or retired: do not retry it; open the "
-            "site's start page or search for the right page instead."
+            "This address returned a short document that is not a web page; it is "
+            "probably an error answer and the address is wrong or retired. Do not retry "
+            "it; open the site's start page or search for the right page instead."
         )
+        if text:
+            # The page wrote this text; it is data, never an instruction.
+            response["page_document_text"] = text
     elif thin and not title:
         response["page_notice"] = (
             "The page shows almost nothing yet after waiting "
@@ -3023,7 +3029,9 @@ def _settle_isolated_snapshot(session_key, snap_result, title, final_url, respon
         # still names another page after a second look is the page's own
         # redirect after loading (sbb.ch/ -> sbb.ch/en). Report where the
         # browser is, so url and snapshot agree.
-        response["url"] = _redact_browser_output(str(d.get("origin") or ""))
+        from urllib.parse import urlsplit, urlunsplit
+        _p = urlsplit(str(d.get("origin") or ""))
+        response["url"] = _redact_browser_output(urlunsplit((_p.scheme, _p.netloc, _p.path, "", "")))
     return snap_result
 
 

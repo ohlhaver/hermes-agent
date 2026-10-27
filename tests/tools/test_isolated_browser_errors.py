@@ -227,7 +227,23 @@ def test_untitled_spa_is_waited_for_beyond_one_look():
 def test_error_document_is_named_and_not_waited_for():
     xml = {"content_type": "application/xml", "consent": False, "document_text": "AccessDenied Access Denied"}
     out, looks = _navigate([{"snapshot": "- generic", "refs": {"e1": 1}, "origin": "https://site.example/a", "page_info": xml}])
-    assert looks == 1 and "error document" in out["page_notice"] and "AccessDenied" in out["page_notice"]
+    assert looks == 1 and "not a web page" in out["page_notice"]
+    assert "AccessDenied" not in out["page_notice"] and "AccessDenied" in out["page_document_text"]
+
+
+def test_pdf_and_full_non_html_pages_are_not_called_errors():
+    pdf = {"content_type": "application/pdf", "consent": False, "document_text": ""}
+    out, _ = _navigate([{"snapshot": "- generic", "refs": {"e1": 1}, "origin": "https://site.example/a", "page_info": pdf}], title="T")
+    assert "page_notice" not in out
+    xml = {"content_type": "text/xml", "consent": False, "document_text": "feed"}
+    out, _ = _navigate([{"snapshot": "- x", "refs": _FULL, "origin": "https://site.example/a", "page_info": xml}], title="T")
+    assert "page_notice" not in out
+
+
+def test_reported_url_after_a_redirect_carries_no_query():
+    other = {"snapshot": "- x", "refs": _FULL, "origin": "https://other.example/cb?code=SECRET#frag", "page_info": _HTML}
+    out, _ = _navigate([other, other], title="T")
+    assert out["url"] == "https://other.example/cb"
 
 
 def test_snapshot_of_another_page_is_taken_again_then_named():

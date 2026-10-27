@@ -420,6 +420,9 @@ class NativeBrowserExecutor:
         self._tab_order = order + new
         return new
 
+    # The tab in use is the one the last action opened or navigated. A tab the
+    # user picks by hand during takeover is not followed unless it is new; the
+    # agent's next command goes back to the tab it was working in.
     def _focus_tab(self, pages, page_id):
         if len(pages) < 2 or not page_id:
             return
@@ -520,6 +523,10 @@ class NativeBrowserExecutor:
             result = self.bt._run_browser_command(self.session_id, command, args)
             if not result.get("success"):
                 return {"success": False, "error": "Browser action failed; user takeover may be required."}
+            data = result.get("data", {})
+            # HPD-1798: read the page facts before the redirect check below, so
+            # that check also covers the page they were read from.
+            info = self._page_info() if command in ("open", "snapshot") and isinstance(data, dict) else None
             # Check redirects before returning any browser data. Network egress
             # is separately restricted by deployment, including DNS rebinding.
             pages = self.pages()
@@ -527,14 +534,15 @@ class NativeBrowserExecutor:
                 url = page.get("url", "")
                 if url != "about:blank" and not self._url_allowed(url):
                     raise BrowserBoundaryError("blocked_target")
-            data = result.get("data", {})
             self._after_command(command, data, pages)
-            if command in ("open", "snapshot") and isinstance(data, dict):
-                info = self._page_info()
-                if info is not None:
-                    data["page_info"] = info
+            if info is not None:
+                data["page_info"] = info
             if isinstance(data, dict) and isinstance(data.get("url"), str):
                 data["url"] = public_url(data["url"])
+            # The snapshot's origin is the page's full address; query and
+            # fragment can carry codes (OAuth callback) and never leave the broker.
+            if isinstance(data, dict) and isinstance(data.get("origin"), str):
+                data["origin"] = public_url(data["origin"])
             if command == "eval" and args == ["window.location.href"] and isinstance(data, dict):
                 if isinstance(data.get("result"), str):
                     data["result"] = public_url(data["result"])

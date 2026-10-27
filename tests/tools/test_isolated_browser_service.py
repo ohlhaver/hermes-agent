@@ -491,3 +491,18 @@ def test_open_and_snapshot_carry_page_info(executor_factory, monkeypatch):
     out = executor.execute("open", ["https://example.com/"])
     assert out["data"]["page_info"] == {"content_type": "text/html", "consent": False, "document_text": ""}
     assert "page_info" not in executor.execute("click", ["@e1"]).get("data", {})
+
+
+def test_snapshot_origin_leaves_the_broker_without_query(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    _scripted(executor, monkeypatch, [[{"id": "A", "url": "https://example.com/cb"}]])
+    real = bt._run_browser_command
+
+    def run(sid, command, args):
+        out = real(sid, command, args)
+        if command == "snapshot":
+            out["data"] = {"snapshot": "- x", "refs": {}, "origin": "https://example.com/cb?code=SECRET#f"}
+        return out
+    monkeypatch.setattr(bt, "_run_browser_command", run)
+    out = executor.execute("snapshot", ["-c"])
+    assert out["data"]["origin"] == "https://example.com/cb"
