@@ -37,6 +37,7 @@ from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
+    sanitize_tool_call_name,
 )
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
@@ -1440,7 +1441,11 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                 "response_item_id": response_item_id,
                 "type": tool_call.type,
                 "function": {
-                    "name": tool_call.function.name,
+                    # Stored names must be provider-safe: a hallucinated name
+                    # with a space/umlaut/newline replayed from history is a
+                    # non-retryable 400 on strict Responses backends and kills
+                    # the chat (HPD-1785).  Valid names pass unchanged.
+                    "name": sanitize_tool_call_name(tool_call.function.name),
                     "arguments": tool_call.function.arguments
                 },
             }
