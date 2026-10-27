@@ -363,9 +363,12 @@ _AGENT_ERROR_TEXT = {
     "session_expired": (
         "The browser session has ended. Open the page again with browser_navigate."
     ),
+    # HPD-1787 (approved by Justus 2026-10-27): on fc-justus-3 a brief failure of
+    # the public-address check made Uber Eats look "not public" and the task stopped.
     "blocked_target": (
-        "This address cannot be opened (it does not exist or is not a public website). "
-        "Check the address or search for the right page; the browser is working."
+        "This address cannot be opened right now (it may not exist, may not be public, or the check failed briefly). "
+        "Try the same step once more; if it fails again, search for the right page or use another site. "
+        "The browser is working."
     ),
     "browser_unavailable": (
         "The protected browser did not answer, also not after waiting about 20 seconds. "

@@ -140,6 +140,8 @@ def test_snapshot_and_navigate_pass_code():
 def test_blocked_target_text():
     text = ib._AGENT_ERROR_TEXT["blocked_target"]
     assert "cannot be opened" in text and "browser is working" in text
+    # HPD-1787: a refusal can be a brief check failure; the model tries once more.
+    assert "check failed briefly" in text and "Try the same step once more" in text
 
 
 def test_navigate_settles_once_in_isolated_browser():
