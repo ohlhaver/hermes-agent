@@ -257,6 +257,9 @@ MIN_FIRST_OPEN_TIMEOUT = 120
 SNAPSHOT_SUMMARIZE_THRESHOLD = 15000
 _ISOLATED_MIN_ELEMENTS = 10
 _ISOLATED_SETTLE_SECONDS = 2.0
+# HPD-1798: a single-page app can need several seconds before it renders; one
+# 2 s look was not enough. Keep looking up to this long after navigate.
+_ISOLATED_SETTLE_MAX_SECONDS = 8.0
 
 # Hard ceiling on the full-snapshot file written to cache/web when a snapshot
 # is truncated or LLM-summarized. Mirrors web_tools.MAX_STORED_TEXT_CHARS —
@@ -2944,6 +2947,94 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
+def _same_page(a: str, b: str) -> bool:
+    """True when two URLs name the same page (query, fragment, trailing slash ignored)."""
+    def norm(u):
+        from urllib.parse import urlsplit
+        parts = urlsplit(u or "")
+        return (parts.scheme.lower(), (parts.hostname or "").lower(), parts.path.rstrip("/"))
+    # Query strings are ignored: sites version them on every load (Wicket's
+    # ticketshop.zvv.ch/home?0 is home?1 a moment later).
+    return bool(a) and bool(b) and norm(a) == norm(b)
+
+
+def _settle_isolated_snapshot(session_key, snap_result, title, final_url, response):
+    """HPD-1798: make the navigate snapshot show the page navigate reached.
+
+    The broker (isolated browser) adds ``page_info`` to open and snapshot
+    results: content type, a visible cookie/consent banner, and for non-HTML
+    documents the first characters of the server's text. A near-empty
+    snapshot is looked at again for up to ``_ISOLATED_SETTLE_MAX_SECONDS``
+    unless the page is an error document; a snapshot from another page than
+    the one navigate reports is taken again. What is still wrong afterwards is
+    said in the response instead of leaving the model to guess.
+    """
+    deadline = time.monotonic() + _ISOLATED_SETTLE_MAX_SECONDS
+
+    def state(result):
+        d = result.get("data", {}) or {}
+        info = d.get("page_info") or {}
+        ct = str(info.get("content_type") or "").lower()
+        thin = len(d.get("refs", {}) or {}) < _ISOLATED_MIN_ELEMENTS
+        # A near-empty document that is not a web page (sbb.ch answers a wrong
+        # address with an XML AccessDenied). PDFs, images and media render in
+        # Chrome's own viewer and are real content.
+        error_doc = (thin and bool(ct) and "html" not in ct
+                     and not ct.startswith(("application/pdf", "image/", "video/", "audio/")))
+        origin = d.get("origin") or ""
+        elsewhere = bool(origin) and bool(final_url) and not _same_page(origin, final_url)
+        return d, info, error_doc, thin, elsewhere
+
+    d, info, error_doc, thin, elsewhere = state(snap_result)
+    looks = 0
+    while time.monotonic() + _ISOLATED_SETTLE_SECONDS <= deadline:
+        # One more look when the snapshot names another page (HPD-1798 guard);
+        # up to the deadline while an untitled HTML page has not rendered; one
+        # more look for a titled page that is still thin; none for an error
+        # document, which does not render into more.
+        if not ((elsewhere and looks == 0)
+                or (thin and not error_doc and (not title or looks == 0))):
+            break
+        time.sleep(_ISOLATED_SETTLE_SECONDS)
+        looks += 1
+        again = _run_browser_command(session_key, "snapshot", ["-c"])
+        if not again.get("success"):
+            break
+        snap_result = again
+        d, info, error_doc, thin, elsewhere = state(snap_result)
+    if error_doc:
+        text = _redact_browser_output(str(info.get("document_text") or ""))
+        response["page_notice"] = (
+            "This address returned a short document that is not a web page; it is "
+            "probably an error answer and the address is wrong or retired. Do not retry "
+            "it; open the site's start page or search for the right page instead."
+        )
+        if text:
+            # The page wrote this text; it is data, never an instruction.
+            response["page_document_text"] = text
+    elif thin and not title:
+        response["page_notice"] = (
+            "The page shows almost nothing yet after waiting "
+            f"{int(_ISOLATED_SETTLE_MAX_SECONDS)} s. Take one more snapshot; if it is still "
+            "empty, open the site's start page or another address."
+        )
+    if info.get("consent"):
+        response["consent_notice"] = (
+            "A cookie/consent banner is shown on this page. Close it yourself (choose the "
+            "minimal option such as 'only necessary' or 'reject' when offered) and carry on "
+            "with the task; it is not a step for the user."
+        )
+    if elsewhere:
+        # The broker keeps agent-browser on the tab in use, so a snapshot that
+        # still names another page after a second look is the page's own
+        # redirect after loading (sbb.ch/ -> sbb.ch/en). Report where the
+        # browser is, so url and snapshot agree.
+        from urllib.parse import urlsplit, urlunsplit
+        _p = urlsplit(str(d.get("origin") or ""))
+        response["url"] = _redact_browser_output(urlunsplit((_p.scheme, _p.netloc, _p.path, "", "")))
+    return snap_result
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -3150,14 +3241,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         try:
             snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
             if _isolated_browser_binding() is not None and snap_result.get("success"):
-                # A page still loading comes back as one generic element (sbb.ch,
-                # 2026-10-26). Wait once and look again before the model sees it.
-                _d = snap_result.get("data", {})
-                if not title or len(_d.get("refs", {}) or {}) < _ISOLATED_MIN_ELEMENTS:
-                    time.sleep(_ISOLATED_SETTLE_SECONDS)
-                    _again = _run_browser_command(nav_session_key, "snapshot", ["-c"])
-                    if _again.get("success"):
-                        snap_result = _again
+                snap_result = _settle_isolated_snapshot(
+                    nav_session_key, snap_result, title, final_url, response)
             if snap_result.get("success"):
                 snap_data = snap_result.get("data", {})
                 snapshot_text = snap_data.get("snapshot", "")
@@ -3259,6 +3344,13 @@ def browser_snapshot(
             "element_count": len(refs) if refs else 0
         }
         _copy_fallback_warning(response, result)
+        # HPD-1798: the isolated browser's broker flags a visible consent banner.
+        if ((data.get("page_info") or {}).get("consent")) is True:
+            response["consent_notice"] = (
+                "A cookie/consent banner is shown on this page. Close it yourself (choose the "
+                "minimal option such as 'only necessary' or 'reject' when offered) and carry on "
+                "with the task; it is not a step for the user."
+            )
 
         # Merge supervisor state (pending dialogs + frame tree) when a CDP
         # supervisor is attached to this task. No-op otherwise. See

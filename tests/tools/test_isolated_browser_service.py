@@ -92,7 +92,7 @@ def test_public_open_uses_service_validator_with_local_dns_unavailable(executor_
     executor, calls = executor_factory(lambda url: checked.append(url) or True)
     assert executor.execute("open", ["https://example.com/"])["success"]
     assert checked == ["https://example.com/", "https://example.com/"]
-    assert calls == [("open", ["https://example.com/"])]
+    assert [c for c in calls if c[0] != "eval"] == [("open", ["https://example.com/"])]
 
 
 def test_standalone_default_still_fails_closed_on_dns_failure(executor_factory):
@@ -422,3 +422,87 @@ def test_shared_hosting_and_public_suffixes_never_receive_a_card(monkeypatch, ho
         return
     with pytest.raises(BrowserBoundaryError, match="command_denied"):
         executor.fill_card(host, FIELDS)
+
+
+# HPD-1798 -----------------------------------------------------------------
+
+def _scripted(executor, monkeypatch, pages_seq, tabs=None, current=None):
+    """Executor whose CDP page list follows pages_seq, one entry per pages() call."""
+    seq = list(pages_seq)
+    executor.pages = lambda: seq.pop(0) if len(seq) > 1 else seq[0]
+    calls = []
+
+    def run(_sid, command, args):
+        calls.append((command, list(args)))
+        if command == "get":
+            return {"success": True, "data": {"url": current[0] if current else ""}}
+        if command == "tab" and args == ["list"]:
+            return {"success": True, "data": {"tabs": tabs or []}}
+        if command == "tab":
+            current[0] = next(t["url"] for t in tabs if t["tabId"] == args[0])
+            return {"success": True, "data": {}}
+        if command == "eval":
+            return {"success": True, "data": {"result": '{"content_type": "text/html", "consent": false, "document_text": ""}'}}
+        return {"success": True, "data": {"url": args[0] if command == "open" else ""}}
+    monkeypatch.setattr(bt, "_run_browser_command", run)
+    return calls
+
+
+def test_click_scrolls_the_ref_into_view_first(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    calls = _scripted(executor, monkeypatch, [[{"id": "A", "url": "https://example.com/"}]])
+    executor.execute("click", ["@e53"])
+    assert calls[:2] == [("scrollintoview", ["@e53"]), ("click", ["@e53"])]
+
+
+def test_one_tab_costs_no_tab_commands(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    calls = _scripted(executor, monkeypatch, [[{"id": "A", "url": "https://example.com/"}]])
+    executor.execute("snapshot", ["-c"])
+    assert [c[0] for c in calls] == ["snapshot", "eval"]
+
+
+def test_a_tab_the_click_opened_is_followed(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    a = {"id": "A", "url": "https://zvv.example/"}
+    b = {"id": "B", "url": "https://shop.example/"}
+    current = ["https://zvv.example/"]
+    tabs = [{"tabId": "t1", "url": a["url"]}, {"tabId": "t2", "url": b["url"]}]
+    calls = _scripted(executor, monkeypatch, [[a], [a, b], [a, b]], tabs=tabs, current=current)
+    executor.execute("click", ["@e8"])
+    assert ("tab", ["t2"]) in calls and current == [b["url"]]
+
+
+def test_a_restarted_daemon_is_put_back_on_the_tab_in_use(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    a = {"id": "A", "url": "https://zvv.example/"}
+    b = {"id": "B", "url": "https://shop.example/"}
+    executor._tab_order, executor._tab_focus = ["A", "B"], "B"
+    current = [a["url"]]  # agent-browser re-attached to the oldest tab
+    tabs = [{"tabId": "t1", "url": a["url"]}, {"tabId": "t2", "url": b["url"]}]
+    calls = _scripted(executor, monkeypatch, [[a, b]], tabs=tabs, current=current)
+    executor.execute("snapshot", ["-c"])
+    assert calls.index(("tab", ["t2"])) < calls.index(("snapshot", ["-c"]))
+
+
+def test_open_and_snapshot_carry_page_info(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    _scripted(executor, monkeypatch, [[{"id": "A", "url": "https://example.com/"}]])
+    out = executor.execute("open", ["https://example.com/"])
+    assert out["data"]["page_info"] == {"content_type": "text/html", "consent": False, "document_text": ""}
+    assert "page_info" not in executor.execute("click", ["@e1"]).get("data", {})
+
+
+def test_snapshot_origin_leaves_the_broker_without_query(executor_factory, monkeypatch):
+    executor, _ = executor_factory(lambda url: True)
+    _scripted(executor, monkeypatch, [[{"id": "A", "url": "https://example.com/cb"}]])
+    real = bt._run_browser_command
+
+    def run(sid, command, args):
+        out = real(sid, command, args)
+        if command == "snapshot":
+            out["data"] = {"snapshot": "- x", "refs": {}, "origin": "https://example.com/cb?code=SECRET#f"}
+        return out
+    monkeypatch.setattr(bt, "_run_browser_command", run)
+    out = executor.execute("snapshot", ["-c"])
+    assert out["data"]["origin"] == "https://example.com/cb"

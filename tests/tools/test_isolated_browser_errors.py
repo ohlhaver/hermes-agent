@@ -187,3 +187,75 @@ def test_long_dialog_keeps_head_buttons_and_end():
 def test_short_dialog_is_not_shrunk():
     lines = ['- dialog "d" [ref=e1]:', '  - button "OK" [ref=e2]']
     assert bt._shrink_dialog_block(lines) == '\n'.join(lines)
+
+
+# HPD-1798 -----------------------------------------------------------------
+
+def _navigate(snapshots, title=""):
+    calls = []
+
+    def run(task, command, args=None, **kw):
+        calls.append(command)
+        if command == "open":
+            return {"success": True, "data": {"title": title, "url": "https://site.example/a"}}
+        n = calls.count("snapshot")
+        return {"success": True, "data": snapshots[min(n, len(snapshots)) - 1]}
+
+    with patch.object(bt, "_run_browser_command", side_effect=run), \
+         patch.object(bt, "_isolated_browser_binding", return_value=("/x", "s")), \
+         patch.object(bt, "_is_camofox_mode", return_value=False), \
+         patch.object(bt, "_get_session_info", return_value={"_first_nav": False}), \
+         patch.object(bt, "check_website_access", return_value=None), \
+         patch.object(bt, "_is_always_blocked_url", return_value=False), \
+         patch.object(bt, "_is_local_backend", return_value=True), \
+         patch.object(bt.time, "sleep"):
+        out = json.loads(bt.browser_navigate("https://site.example/a", task_id="t"))
+    return out, calls.count("snapshot")
+
+
+_HTML = {"content_type": "text/html", "consent": False, "document_text": ""}
+_FULL = {f"e{i}": i for i in range(30)}
+
+
+def test_untitled_spa_is_waited_for_beyond_one_look():
+    thin = {"snapshot": "- generic", "refs": {"e1": 1}, "origin": "https://site.example/a", "page_info": _HTML}
+    full = {"snapshot": "- x", "refs": _FULL, "origin": "https://site.example/a", "page_info": _HTML}
+    out, looks = _navigate([thin, thin, thin, full])
+    assert looks == 4 and out["element_count"] == 30 and "page_notice" not in out
+
+
+def test_error_document_is_named_and_not_waited_for():
+    xml = {"content_type": "application/xml", "consent": False, "document_text": "AccessDenied Access Denied"}
+    out, looks = _navigate([{"snapshot": "- generic", "refs": {"e1": 1}, "origin": "https://site.example/a", "page_info": xml}])
+    assert looks == 1 and "not a web page" in out["page_notice"]
+    assert "AccessDenied" not in out["page_notice"] and "AccessDenied" in out["page_document_text"]
+
+
+def test_pdf_and_full_non_html_pages_are_not_called_errors():
+    pdf = {"content_type": "application/pdf", "consent": False, "document_text": ""}
+    out, _ = _navigate([{"snapshot": "- generic", "refs": {"e1": 1}, "origin": "https://site.example/a", "page_info": pdf}], title="T")
+    assert "page_notice" not in out
+    xml = {"content_type": "text/xml", "consent": False, "document_text": "feed"}
+    out, _ = _navigate([{"snapshot": "- x", "refs": _FULL, "origin": "https://site.example/a", "page_info": xml}], title="T")
+    assert "page_notice" not in out
+
+
+def test_reported_url_after_a_redirect_carries_no_query():
+    other = {"snapshot": "- x", "refs": _FULL, "origin": "https://other.example/cb?code=SECRET#frag", "page_info": _HTML}
+    out, _ = _navigate([other, other], title="T")
+    assert out["url"] == "https://other.example/cb"
+
+
+def test_snapshot_of_another_page_is_taken_again_then_named():
+    other = {"snapshot": "- x", "refs": _FULL, "origin": "https://other.example/b", "page_info": _HTML}
+    right = {"snapshot": "- x", "refs": _FULL, "origin": "https://site.example/a?3", "page_info": _HTML}
+    out, looks = _navigate([other, right], title="T")
+    assert looks == 2 and out["url"] == "https://site.example/a"
+    out, looks = _navigate([other, other], title="T")
+    assert looks == 2 and out["url"] == "https://other.example/b"
+
+
+def test_consent_banner_is_reported():
+    info = dict(_HTML, consent=True)
+    out, _ = _navigate([{"snapshot": "- x", "refs": _FULL, "origin": "https://site.example/a", "page_info": info}], title="T")
+    assert "consent" in out["consent_notice"]

@@ -407,6 +407,99 @@ class NativeBrowserExecutor:
             # Do not export target URLs, resolver errors or private diagnostics.
             return False
 
+    # HPD-1798: which tab agent-browser acts on. A live agent-browser daemon
+    # follows a tab a click opens (target=_blank, window.open). A daemon that
+    # restarted attaches to the OLDEST tab instead (agent-browser 0.26.0,
+    # measured 2026-10-27), so snapshot and click would read a page the user
+    # no longer sees. The broker remembers the tab in use and puts
+    # agent-browser back on it; with one tab this costs nothing.
+    def _track_tabs(self, pages):
+        ids = [p.get("id") for p in pages if p.get("id")]
+        order = [i for i in getattr(self, "_tab_order", []) if i in ids]
+        new = [i for i in ids if i not in order]
+        self._tab_order = order + new
+        return new
+
+    # The tab in use is the one the last action opened or navigated. A tab the
+    # user picks by hand during takeover is not followed unless it is new; the
+    # agent's next command goes back to the tab it was working in.
+    def _focus_tab(self, pages, page_id):
+        if len(pages) < 2 or not page_id:
+            return
+        want = next((p.get("url") for p in pages if p.get("id") == page_id), None)
+        if not want:
+            return
+        run = self.bt._run_browser_command
+        current = run(self.session_id, "get", ["url"])
+        if current.get("success") and (current.get("data") or {}).get("url") == want:
+            return
+        listed = run(self.session_id, "tab", ["list"])
+        tabs = (listed.get("data") or {}).get("tabs") or [] if listed.get("success") else []
+        match = [t.get("tabId") for t in tabs if t.get("url") == want and t.get("tabId")]
+        if match:
+            run(self.session_id, "tab", [match[-1]])
+
+    def _before_command(self):
+        try:
+            pages = self.pages()
+            new = self._track_tabs(pages)
+            alive = getattr(self, "_tab_order", [])
+            if new:
+                self._tab_focus = new[-1]
+            elif getattr(self, "_tab_focus", None) not in alive:
+                self._tab_focus = alive[-1] if alive else None
+            self._focus_tab(pages, self._tab_focus)
+        except Exception:
+            pass
+
+    def _after_command(self, command, data, pages):
+        try:
+            new = self._track_tabs(pages)
+            if new:
+                # The action opened a tab: that is where the user now looks.
+                self._tab_focus = new[-1]
+                self._focus_tab(pages, self._tab_focus)
+            elif command == "open" and isinstance(data, dict):
+                same = [p.get("id") for p in pages if p.get("url") == data.get("url") and p.get("id")]
+                if same:
+                    self._tab_focus = same[-1]
+        except Exception:
+            pass
+
+    # HPD-1798: a fixed, broker-side read of what kind of page this is. An
+    # address that returns an error document (sbb.ch answers a missing page
+    # with an XML "AccessDenied") snapshots as one empty element and the agent
+    # cannot tell it from a page still loading. Only the content type, a
+    # cookie/consent banner flag and, for non-HTML documents only, the first
+    # characters of the server's own text leave the broker - never form values.
+    PAGE_INFO_JS = r"""(() => {
+  const ct = document.contentType || '';
+  const sel = '#onetrust-banner-sdk,#onetrust-consent-sdk,#usercentrics-root,#usercentrics-cmp-ui,' +
+    '#CybotCookiebotDialog,#didomi-host,#truste-consent-track,.qc-cmp2-container,#sp_message_container,' +
+    '[id*="cookie" i][role="dialog"],[class*="cookie-banner" i],[class*="consent-banner" i],[aria-label*="cookie" i][role="dialog"]';
+  let consent = false;
+  for (const el of document.querySelectorAll(sel)) {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    if (s.display !== 'none' && s.visibility !== 'hidden' && (r.width > 0 || el.shadowRoot)) { consent = true; break; }
+  }
+  const html = /html/i.test(ct);
+  const text = html ? '' : ((document.documentElement && document.documentElement.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  return JSON.stringify({content_type: ct, consent: consent, document_text: text});
+})()"""
+
+    def _page_info(self):
+        try:
+            out = self.bt._run_browser_command(self.session_id, "eval", [self.PAGE_INFO_JS])
+            raw = (out.get("data") or {}).get("result") if out.get("success") else None
+            info = json.loads(raw) if isinstance(raw, str) else None
+            if not isinstance(info, dict):
+                return None
+            return {"content_type": str(info.get("content_type", ""))[:80],
+                    "consent": info.get("consent") is True,
+                    "document_text": str(info.get("document_text", ""))[:160]}
+        except Exception:
+            return None
+
     def execute(self, command, args):
         from agent.redact import redact_sensitive_text
         with self.lock:
@@ -416,9 +509,24 @@ class NativeBrowserExecutor:
                 if not self._url_allowed(args[0]):
                     # Own code: "this address cannot be opened" is not "command not allowed".
                     raise BrowserBoundaryError("blocked_target")
+            self._before_command()
+            if command == "click" and args:
+                # HPD-1798: agent-browser 0.26.0 over CDP reports a click on an
+                # element below the fold as done without scrolling to it, and
+                # nothing happens (ZVV "Zone 110", 2026-10-27; fill does scroll).
+                # Later agent-browser releases scroll first; until the pin
+                # moves, the broker scrolls the same ref into view itself.
+                try:
+                    self.bt._run_browser_command(self.session_id, "scrollintoview", [args[0]])
+                except Exception:
+                    pass
             result = self.bt._run_browser_command(self.session_id, command, args)
             if not result.get("success"):
                 return {"success": False, "error": "Browser action failed; user takeover may be required."}
+            data = result.get("data", {})
+            # HPD-1798: read the page facts before the redirect check below, so
+            # that check also covers the page they were read from.
+            info = self._page_info() if command in ("open", "snapshot") and isinstance(data, dict) else None
             # Check redirects before returning any browser data. Network egress
             # is separately restricted by deployment, including DNS rebinding.
             pages = self.pages()
@@ -426,9 +534,15 @@ class NativeBrowserExecutor:
                 url = page.get("url", "")
                 if url != "about:blank" and not self._url_allowed(url):
                     raise BrowserBoundaryError("blocked_target")
-            data = result.get("data", {})
+            self._after_command(command, data, pages)
+            if info is not None:
+                data["page_info"] = info
             if isinstance(data, dict) and isinstance(data.get("url"), str):
                 data["url"] = public_url(data["url"])
+            # The snapshot's origin is the page's full address; query and
+            # fragment can carry codes (OAuth callback) and never leave the broker.
+            if isinstance(data, dict) and isinstance(data.get("origin"), str):
+                data["origin"] = public_url(data["origin"])
             if command == "eval" and args == ["window.location.href"] and isinstance(data, dict):
                 if isinstance(data.get("result"), str):
                     data["result"] = public_url(data["result"])
