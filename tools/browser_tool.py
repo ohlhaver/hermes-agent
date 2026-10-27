@@ -3014,15 +3014,16 @@ def _settle_isolated_snapshot(session_key, snap_result, title, final_url, respon
         )
     if info.get("consent"):
         response["consent_notice"] = (
-            "A cookie/consent banner is shown on this page. Close it first (choose the "
-            "minimal option such as 'only necessary' or 'reject' when offered), then continue."
+            "A cookie/consent banner is shown on this page. Close it yourself (choose the "
+            "minimal option such as 'only necessary' or 'reject' when offered) and carry on "
+            "with the task; it is not a step for the user."
         )
     if elsewhere:
-        response["snapshot_url"] = _redact_browser_output(str(d.get("origin") or ""))
-        response["snapshot_notice"] = (
-            "The visible tab now shows snapshot_url, not url (a redirect after loading, "
-            "or a tab the page opened). The snapshot is of snapshot_url."
-        )
+        # The broker keeps agent-browser on the tab in use, so a snapshot that
+        # still names another page after a second look is the page's own
+        # redirect after loading (sbb.ch/ -> sbb.ch/en). Report where the
+        # browser is, so url and snapshot agree.
+        response["url"] = _redact_browser_output(str(d.get("origin") or ""))
     return snap_result
 
 
@@ -3338,8 +3339,9 @@ def browser_snapshot(
         # HPD-1798: the isolated browser's broker flags a visible consent banner.
         if ((data.get("page_info") or {}).get("consent")) is True:
             response["consent_notice"] = (
-                "A cookie/consent banner is shown on this page. Close it first (choose the "
-                "minimal option such as 'only necessary' or 'reject' when offered), then continue."
+                "A cookie/consent banner is shown on this page. Close it yourself (choose the "
+                "minimal option such as 'only necessary' or 'reject' when offered) and carry on "
+                "with the task; it is not a step for the user."
             )
 
         # Merge supervisor state (pending dialogs + frame tree) when a CDP

@@ -234,9 +234,9 @@ def test_snapshot_of_another_page_is_taken_again_then_named():
     other = {"snapshot": "- x", "refs": _FULL, "origin": "https://other.example/b", "page_info": _HTML}
     right = {"snapshot": "- x", "refs": _FULL, "origin": "https://site.example/a?3", "page_info": _HTML}
     out, looks = _navigate([other, right], title="T")
-    assert looks == 2 and "snapshot_url" not in out
+    assert looks == 2 and out["url"] == "https://site.example/a"
     out, looks = _navigate([other, other], title="T")
-    assert looks == 2 and out["snapshot_url"] == "https://other.example/b" and "snapshot_notice" in out
+    assert looks == 2 and out["url"] == "https://other.example/b"
 
 
 def test_consent_banner_is_reported():
