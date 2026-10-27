@@ -43,6 +43,7 @@ from agent.turn_context import (
 from agent.turn_retry_state import TurnRetryState
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    sanitize_tool_call_name,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -4866,7 +4867,7 @@ def run_conversation(
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
                         messages.append({
                             "role": "tool",
-                            "name": tc.function.name,
+                            "name": sanitize_tool_call_name(tc.function.name),
                             "tool_call_id": tc.id,
                             "content": content,
                         })
@@ -4949,7 +4950,7 @@ def run_conversation(
                         messages.append(agent._build_assistant_message(assistant_message, finish_reason))
                         for tc in assistant_message.tool_calls:
                             messages.append({
-                                "role": "tool", "name": tc.function.name, "tool_call_id": tc.id,
+                                "role": "tool", "name": sanitize_tool_call_name(tc.function.name), "tool_call_id": tc.id,
                                 "content": invalid_feedback.get(tc.id, "Skipped: another tool call had invalid JSON."),
                             })
                         _turn_exit_reason = "guardrail_halt"
@@ -4990,7 +4991,7 @@ def run_conversation(
                                 tool_result = "Skipped: other tool call in this response had invalid JSON."
                             messages.append({
                                 "role": "tool",
-                                "name": tc.function.name,
+                                "name": sanitize_tool_call_name(tc.function.name),
                                 "tool_call_id": tc.id,
                                 "content": tool_result,
                             })
@@ -5120,7 +5121,7 @@ def run_conversation(
                     for tc in _invalid_batch_calls:
                         messages.append({
                             "role": "tool",
-                            "name": tc.function.name,
+                            "name": sanitize_tool_call_name(tc.function.name),
                             "tool_call_id": tc.id,
                             "content": _invalid_tool_name_error_content(
                                 tc.function.name, agent.valid_tool_names

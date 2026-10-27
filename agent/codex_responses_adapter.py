@@ -18,6 +18,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
+from agent.message_sanitization import sanitize_tool_call_name
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
@@ -518,6 +519,11 @@ def _chat_messages_to_responses_input(
                         fn_name = fn.get("name")
                         if not isinstance(fn_name, str) or not fn_name.strip():
                             continue
+                        # A hallucinated name stored in the history (space,
+                        # umlaut, newline, ...) is rejected by the Responses
+                        # API with a non-retryable 400 on every replay
+                        # (HPD-1785); normalise it so the chat recovers.
+                        fn_name = sanitize_tool_call_name(fn_name)
 
                         embedded_call_id, embedded_response_item_id = _split_responses_tool_id(
                             tc.get("id")
@@ -622,6 +628,7 @@ def _preflight_codex_input_items(
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing call_id.")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"Codex Responses input[{idx}] function_call is missing name.")
+            name = sanitize_tool_call_name(name)
 
             arguments = item.get("arguments", "{}")
             if isinstance(arguments, dict):
@@ -634,7 +641,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "name": name,
                     "arguments": arguments,
                 }
             )

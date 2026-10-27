@@ -2720,8 +2720,24 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # sentinel so the call and its result stay PAIRED — the adapter no longer
     # drops the function_call, so there is no orphaned output and no 400, while
     # the result content the model needs is preserved.
-    _EMPTY_NAME_SENTINEL = "invalid_tool_call"
+    #
+    # The same pass normalises NON-empty names the provider would reject
+    # (anything outside ``^[a-zA-Z0-9_.-]+``: spaces, umlauts, newlines,
+    # ``<|...|>`` tokens).  Strict Responses backends answer such a replayed
+    # ``function_call.name`` with a non-retryable HTTP 400, so one hallucinated
+    # name already stored in the history killed the conversation for good
+    # (HPD-1785).  Valid names are left byte-identical.
+    from agent.message_sanitization import (
+        INVALID_TOOL_NAME_SENTINEL as _EMPTY_NAME_SENTINEL,
+        is_valid_tool_call_name,
+        sanitize_tool_call_name,
+    )
     for msg in messages:
+        if msg.get("role") == "tool":
+            _tool_name = msg.get("name")
+            if _tool_name is not None and not is_valid_tool_call_name(_tool_name):
+                msg["name"] = sanitize_tool_call_name(_tool_name)
+            continue
         if msg.get("role") != "assistant":
             continue
         tcs = msg.get("tool_calls") or []
@@ -2734,23 +2750,34 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             else:
                 fn = getattr(tc, "function", None)
                 name = getattr(fn, "name", None) if fn else None
-            if isinstance(name, str) and name.strip():
+            if is_valid_tool_call_name(name):
                 continue
-            _ra().logger.warning(
-                "Pre-call sanitizer: repairing tool_call with empty "
-                "function.name -> %r (id=%s)",
-                _EMPTY_NAME_SENTINEL,
-                _ra().AIAgent._get_tool_call_id_static(tc),
-            )
+            if isinstance(name, str) and name.strip():
+                repaired = sanitize_tool_call_name(name)
+                _ra().logger.warning(
+                    "Pre-call sanitizer: repairing tool_call with invalid "
+                    "function.name %r -> %r (id=%s)",
+                    name[:80],
+                    repaired,
+                    _ra().AIAgent._get_tool_call_id_static(tc),
+                )
+            else:
+                repaired = _EMPTY_NAME_SENTINEL
+                _ra().logger.warning(
+                    "Pre-call sanitizer: repairing tool_call with empty "
+                    "function.name -> %r (id=%s)",
+                    _EMPTY_NAME_SENTINEL,
+                    _ra().AIAgent._get_tool_call_id_static(tc),
+                )
             if isinstance(fn, dict):
-                fn["name"] = _EMPTY_NAME_SENTINEL
+                fn["name"] = repaired
             elif fn is not None and hasattr(fn, "name"):
                 try:
-                    fn.name = _EMPTY_NAME_SENTINEL
+                    fn.name = repaired
                 except Exception:
                     pass
             elif isinstance(tc, dict):
-                tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
+                tc["function"] = {"name": repaired, "arguments": "{}"}
 
     surviving_call_ids: set = set()
     for msg in messages:

@@ -27,6 +27,43 @@ logger = logging.getLogger(__name__)
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
+# Tool / function names the strict providers accept.  OpenAI Responses (and
+# the Codex backend behind ``openai-codex``) reject any ``function_call.name``
+# outside ``^[a-zA-Z0-9_.-]+\Z`` with a non-retryable HTTP 400
+# ("Invalid 'input[N].name': string does not match pattern").  A model that
+# hallucinates a tool name with a space, umlaut, newline, ``<|...|>`` token or
+# similar used to have that raw name stored in the session history; every later
+# request replayed it and the conversation was dead for good (HPD-1785).
+_VALID_TOOL_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+")
+_INVALID_TOOL_NAME_CHARS_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+_TOOL_NAME_MAX_LEN = 64
+INVALID_TOOL_NAME_SENTINEL = "invalid_tool_call"
+
+
+def is_valid_tool_call_name(name: Any) -> bool:
+    """True when ``name`` is a non-empty string every provider accepts."""
+    return isinstance(name, str) and bool(_VALID_TOOL_NAME_RE.fullmatch(name))
+
+
+def sanitize_tool_call_name(name: Any) -> str:
+    """Return a provider-safe tool name.
+
+    Valid names are returned unchanged (byte-stable history, prompt cache).
+    Anything else has each run of disallowed characters replaced by ``_``,
+    is trimmed of edge underscores and capped at 64 characters; a name with
+    nothing usable left becomes ``invalid_tool_call``.  Only names the model
+    invented go down this path, so the result never collides with a real
+    tool by accident in a way that matters: the call is answered with an
+    "unknown tool" error either way.
+    """
+    if is_valid_tool_call_name(name):
+        return name
+    text = name if isinstance(name, str) else ("" if name is None else str(name))
+    cleaned = _INVALID_TOOL_NAME_CHARS_RE.sub("_", text.strip()).strip("_")
+    cleaned = cleaned[:_TOOL_NAME_MAX_LEN].strip("_")
+    return cleaned or INVALID_TOOL_NAME_SENTINEL
+
+
 
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).
@@ -463,6 +500,9 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 
 __all__ = [
     "_SURROGATE_RE",
+    "INVALID_TOOL_NAME_SENTINEL",
+    "is_valid_tool_call_name",
+    "sanitize_tool_call_name",
     "close_interrupted_tool_sequence",
     "_sanitize_surrogates",
     "_sanitize_structure_surrogates",
