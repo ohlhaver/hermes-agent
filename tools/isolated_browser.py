@@ -365,9 +365,11 @@ _AGENT_ERROR_TEXT = {
     ),
     # HPD-1787 (approved by Justus 2026-10-27): on fc-justus-3 a brief failure of
     # the public-address check made Uber Eats look "not public" and the task stopped.
+    # Rules review 2026-10-28 (Justus "Ja"): the retry is a browser_navigate only, so
+    # a click, type or submit that already ran before a refused redirect is never repeated.
     "blocked_target": (
         "This address cannot be opened right now (it may not exist, may not be public, or the check failed briefly). "
-        "Try the same step once more; if it fails again, search for the right page or use another site. "
+        "Try opening the page once more with browser_navigate; if it fails again, search for the right page or use another site. "
         "The browser is working."
     ),
     "browser_unavailable": (
