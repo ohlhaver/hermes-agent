@@ -638,3 +638,84 @@ class TestCronDemotion:
         # Interactive rows first, in original relative order; cron last, in
         # original relative order.
         assert [r["id"] for r in ordered] == [2, 4, 5, 1, 3]
+
+
+# =========================================================================
+# HPD-1808: the compacted past of the CURRENT chat stays findable
+# =========================================================================
+
+def _seed_long_home_chat(db):
+    """One Home session compacted in place, plus one rewound row."""
+    db.create_session("s_home", source="web")
+    db.append_message("s_home", role="user", content="Aman needs a TRC and a No-PE declaration before he can pay")
+    db.append_message("s_home", role="assistant", content="Noted: TRC and No-PE declaration for the Code Symphony invoice.")
+    db._conn.commit()
+    db.archive_and_compact("s_home", [
+        {"role": "user", "content": "[CONTEXT COMPACTION] earlier turns summarised"},
+        {"role": "assistant", "content": "Continuing."},
+    ])
+    db.append_message("s_home", role="user", content="Live question about the zebra parking permit")
+    # A rewound row: active=0 but not compacted -- the user took it back.
+    db.append_message("s_home", role="user", content="Rewound remark about the walrus invoice")
+    db._conn.execute("UPDATE messages SET active = 0, compacted = 0 WHERE content LIKE 'Rewound%'")
+    db._conn.commit()
+
+
+class TestCurrentChatCompactedHistory:
+    def test_compacted_rows_of_current_session_are_found(self, db):
+        _seed_long_home_chat(db)
+        result = json.loads(session_search(query="TRC", db=db, current_session_id="s_home"))
+        assert result["success"] is True
+        assert result["count"] == 1
+        hit = result["results"][0]
+        assert hit["session_id"] == "s_home"
+        assert "TRC" in hit["snippet"]
+
+    def test_live_rows_of_current_session_stay_skipped(self, db):
+        _seed_long_home_chat(db)
+        result = json.loads(session_search(query="zebra", db=db, current_session_id="s_home"))
+        assert result["count"] == 0
+
+    def test_rewound_rows_stay_hidden(self, db):
+        _seed_long_home_chat(db)
+        result = json.loads(session_search(query="walrus", db=db, current_session_id="s_home"))
+        assert result["count"] == 0
+
+    def test_scroll_into_compacted_history_of_current_session(self, db):
+        _seed_long_home_chat(db)
+        hit = json.loads(session_search(query="TRC", db=db, current_session_id="s_home"))["results"][0]
+        result = json.loads(session_search(
+            session_id="s_home", around_message_id=hit["match_message_id"], db=db,
+            current_session_id="s_home",
+        ))
+        assert result["success"] is True
+        assert any("TRC" in (m.get("content") or "") for m in result["messages"])
+
+    def test_scroll_on_live_row_of_current_session_still_rejected(self, db):
+        _seed_long_home_chat(db)
+        live_id = db._conn.execute(
+            "SELECT id FROM messages WHERE content LIKE 'Live question%'").fetchone()[0]
+        result = json.loads(session_search(
+            session_id="s_home", around_message_id=live_id, db=db, current_session_id="s_home",
+        ))
+        assert result["success"] is False
+
+    def test_compression_parent_in_current_lineage_is_found(self, db):
+        db.create_session("s_parent", source="web")
+        db.append_message("s_parent", role="user", content="The kumquat delivery arrives on Friday")
+        db.end_session("s_parent", "compression")
+        db.create_session("s_child", source="web", parent_session_id="s_parent")
+        db.append_message("s_child", role="user", content="hello again")
+        db._conn.commit()
+        result = json.loads(session_search(query="kumquat", db=db, current_session_id="s_child"))
+        assert result["count"] == 1
+        assert result["results"][0]["session_id"] == "s_parent"
+
+    def test_live_delegation_child_stays_skipped(self, db):
+        db.create_session("s_main", source="web")
+        db.append_message("s_main", role="user", content="hello")
+        db.create_session("s_deleg", source="web", parent_session_id="s_main")
+        db.append_message("s_deleg", role="assistant", content="The pomelo report is ready")
+        db._conn.commit()
+        result = json.loads(session_search(query="pomelo", db=db, current_session_id="s_main"))
+        assert result["count"] == 0
