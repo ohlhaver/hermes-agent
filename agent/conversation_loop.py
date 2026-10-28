@@ -562,6 +562,60 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
+def _route_direct_deferred_tool_call(agent, tc) -> bool:
+    """HPD-1808: a direct call of a deferred tool runs through ``tool_call``.
+
+    Under Tool Search the deferred tools (MCP and plugin tools) are named in
+    the ``tool_search`` catalog listing but are not in the tools array, so a
+    model that calls one by its exact name -- measured on fc-justus-3 on
+    2026-10-28: ``mcp__basic_memory__search_notes`` -- was told "Tool ... does
+    not exist" and never retried through the bridge. The call is rewritten to
+    the ``tool_call`` bridge with the same name and arguments, so it takes the
+    bridge's own path: the session scope gate in ``tool_executor`` /
+    ``model_tools``, hooks, approvals and result handling are the ones a
+    ``tool_call`` gets. Only an exact name of a deferrable tool in this
+    session's scope is routed; anything else keeps the "does not exist"
+    error. Not in default Hermes: upstream rejects the direct call; Hey Hermes
+    runs Tool Search "on" (HPD-1151), which makes every MCP/plugin tool reach
+    the model only by name.
+    """
+    try:
+        from tools import tool_search as _ts
+        from agent.tool_executor import _tool_search_scoped_names
+    except Exception:
+        return False
+    name = getattr(tc.function, "name", "") or ""
+    if (
+        not name
+        or name in agent.valid_tool_names
+        or _ts.TOOL_CALL_NAME not in agent.valid_tool_names
+        or name in _ts.BRIDGE_TOOL_NAMES
+    ):
+        return False
+    try:
+        if name not in _tool_search_scoped_names(agent):
+            return False
+    except Exception:
+        return False
+    raw = tc.function.arguments
+    if isinstance(raw, (dict, list)):
+        underlying_args = raw
+    elif raw is None or (isinstance(raw, str) and not raw.strip()):
+        underlying_args = {}
+    else:
+        try:
+            underlying_args = json.loads(raw)
+        except (TypeError, ValueError):
+            # Broken JSON reaches the bridge as a string, which answers it
+            # with its own invalid-arguments error and runs nothing.
+            underlying_args = raw if isinstance(raw, str) else str(raw)
+    tc.function.name = _ts.TOOL_CALL_NAME
+    tc.function.arguments = json.dumps(
+        {"name": name, "arguments": underlying_args}, ensure_ascii=False
+    )
+    return True
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -4794,6 +4848,12 @@ def run_conversation(
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
+                        # HPD-1808: an exact deferred tool name goes through
+                        # the tool_call bridge before any fuzzy repair.
+                        _deferred_name = tc.function.name
+                        if _route_direct_deferred_tool_call(agent, tc):
+                            print(f"{agent.log_prefix}🔧 Deferred tool called directly: '{_deferred_name}' -> tool_call")
+                            continue
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")

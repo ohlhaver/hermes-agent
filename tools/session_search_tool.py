@@ -103,6 +103,43 @@ def _resolve_to_parent(db, session_id: str) -> str:
     return cur
 
 
+# HPD-1808: the history of the CURRENT chat that left the live context stays
+# findable. Backport of upstream NousResearch/hermes-agent 711f1c2f1a
+# ("surface compaction-archived and compression-parent sessions in discovery",
+# closes #13840/#13841) with upstream's later refinement that only a
+# compaction archive (active=0, compacted=1) counts, never a rewind/undo row
+# (active=0, compacted=0). Reason for carrying it ahead of a full upstream
+# sync: a Home chat is one session for months (fc-justus-3: one session since
+# 2026-09-14, 6,338 messages, compacted in place many times), and the
+# unconditional "skip the current session lineage" below hid every one of
+# those messages from session_search although search_messages() already
+# returns compacted rows on purpose (#38763).
+def _message_left_live_context(db, message_id) -> bool:
+    """True for a compaction-archived row (active=0, compacted=1). False on any error."""
+    if not message_id:
+        return False
+    try:
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT active, compacted FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+    except Exception:
+        logging.debug("message storage-state lookup failed for %s", message_id, exc_info=True)
+        return False
+    return row is not None and row["active"] == 0 and row["compacted"] == 1
+
+
+def _session_left_live_context(db, session_id: str) -> bool:
+    """True when the session was summarised into a continuation child (legacy rotation)."""
+    if not session_id:
+        return False
+    try:
+        meta = db.get_session(session_id) or {}
+    except Exception:
+        return False
+    return meta.get("end_reason") == "compression"
+
+
 def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Stable-sort FTS rows so interactive sessions rank above automation.
 
@@ -300,6 +337,21 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
 
 
+def _anchor_left_live_context(db, message_id) -> bool:
+    """HPD-1808: the scroll anchor is no longer in the caller's live context."""
+    if _message_left_live_context(db, message_id):
+        return True
+    try:
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT session_id, active FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+    except Exception:
+        return False
+    # A rewind/undo row (active=0, compacted=0) never counts as history.
+    return row is not None and row["active"] == 1 and _session_left_live_context(db, row["session_id"])
+
+
 def _scroll(
     db,
     session_id: str,
@@ -332,10 +384,13 @@ def _scroll(
 
     # Reject scrolling inside the active session lineage — those messages are
     # already in context.
+    # HPD-1808: history of the current lineage that left the live context
+    # (a compacted row, or a session summarised into its child) may be
+    # scrolled, so a discovery result never leads to a rejected scroll.
     if current_session_id:
         a_root = _resolve_to_parent(db, session_id)
         c_root = _resolve_to_parent(db, current_session_id)
-        if a_root and c_root and a_root == c_root:
+        if a_root and c_root and a_root == c_root and not _anchor_left_live_context(db, around_message_id):
             return tool_error(
                 "scroll rejected: anchor lives in the current session lineage (already in your active context)",
                 success=False,
@@ -557,10 +612,14 @@ def _discover(
             break
         raw_sid = r["session_id"]
         resolved_sid = _resolve_to_parent(db, raw_sid)
-        # Skip the current session lineage
-        if current_lineage_root and resolved_sid == current_lineage_root:
+        # Skip the current session lineage -- unless the hit left the live
+        # context (HPD-1808, upstream 711f1c2f1a): a compaction-archived row
+        # of this very session, or a session summarised into its child.
+        compacted_hit = _message_left_live_context(db, r.get("id"))
+        if current_lineage_root and resolved_sid == current_lineage_root and not (
+                compacted_hit or _session_left_live_context(db, raw_sid)):
             continue
-        if current_session_id and raw_sid == current_session_id:
+        if current_session_id and raw_sid == current_session_id and not compacted_hit:
             continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
