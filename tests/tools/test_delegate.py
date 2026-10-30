@@ -1005,6 +1005,61 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
             self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
 
+    def test_structured_child_outcome_reaches_result_and_stop_hook(self):
+        """Failure text is not successful output; partial work is still usable."""
+        cases = [
+            ("billing", {"failed": True, "completed": False,
+                         "error": "Credits exhausted", "failure_reason": "billing",
+                         "final_response": "Billing or credits exhausted."},
+             "failed", "error"),
+            ("provider", {"failed": True, "completed": False,
+                          "error": "Provider unavailable", "failure_reason": "server_error",
+                          "final_response": "API call failed after retries."},
+             "failed", "error"),
+            ("neutral_failure_text", {"failed": True, "completed": False,
+                                      "final_response": "Here is the available information."},
+             "failed", "error"),
+            ("success", {"completed": True, "final_response": "Done."},
+             "completed", "completed"),
+            ("partial", {"completed": False, "final_response": "Useful partial findings."},
+             "completed", "max_iterations"),
+            ("partial_with_error", {"completed": False, "partial": True,
+                                    "error": "Response truncated due to output length limit",
+                                    "final_response": "Response truncated due to output length limit"},
+             "completed", "max_iterations"),
+            ("interrupted_failure", {"interrupted": True, "failed": True,
+                                     "completed": False, "final_response": "Stopped."},
+             "interrupted", "interrupted"),
+            ("empty", {"completed": False, "final_response": ""},
+             "failed", "max_iterations"),
+            ("empty_sentinel", {"completed": True, "final_response": "(empty)"},
+             "failed", "completed"),
+        ]
+        for name, outcome, expected_status, expected_exit in cases:
+            with self.subTest(name=name), patch("run_agent.AIAgent") as MockAgent, \
+                    patch("hermes_cli.plugins.invoke_hook") as hook:
+                child = MagicMock()
+                child.model = "test-model"
+                child.session_prompt_tokens = 0
+                child.session_completion_tokens = 0
+                child.run_conversation.return_value = {
+                    "api_calls": 1, "messages": [], **outcome,
+                }
+                MockAgent.return_value = child
+                result = json.loads(delegate_task(
+                    goal="Classify mocked child outcome", parent_agent=_make_mock_parent(),
+                ))
+                entry = result["results"][0]
+                self.assertEqual(entry["status"], expected_status)
+                self.assertEqual(entry["summary"], outcome["final_response"])
+                self.assertEqual(entry["exit_reason"], expected_exit)
+                self.assertNotIn("truncated", entry)
+                stops = [call for call in hook.call_args_list
+                         if call.args and call.args[0] == "subagent_stop"]
+                self.assertEqual(len(stops), 1)
+                self.assertEqual(stops[0].kwargs["child_status"], expected_status)
+                self.assertEqual(stops[0].kwargs["child_summary"], outcome["final_response"])
+
     def test_empty_sentinel_marks_status_failed(self):
         """Regression: a child that returns the literal '(empty)' sentinel
         (emitted by run_agent.py when the LLM returns empty responses after

@@ -2126,6 +2126,7 @@ def _run_single_child(
 
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
+        failed = result.get("failed") is True
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
@@ -2138,6 +2139,10 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif failed:
+            # Provider failures also carry a nonempty, user-facing summary.
+            # Explicit failure must win over that text being usable output.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -2185,6 +2190,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif failed:
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
