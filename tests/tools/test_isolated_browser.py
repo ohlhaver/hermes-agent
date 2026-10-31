@@ -272,3 +272,13 @@ def test_actual_tool_projection_carries_only_bound_native_handoff(monkeypatch):
     assert browser_tool._copy_fallback_warning({}, {**result, "takeover_href": "https://foreign.invalid"}) == {}
     monkeypatch.setattr(browser_tool, "_isolated_browser_binding", lambda: None)
     assert browser_tool._copy_fallback_warning({}, result) == {}
+
+
+def test_broker_allows_only_the_fixed_suggestion_count_query(boundary):
+    # HPD-1901: browser_type counts suggestion entries with one fixed query.
+    from tools.isolated_browser import SUGGESTION_COUNT_JS
+    assert agent(boundary, "eval", [SUGGESTION_COUNT_JS])["success"]
+    assert agent(boundary, "snapshot", ["-i"])["success"]
+    assert agent(boundary, "press", ["End"])["success"]
+    with pytest.raises(BrowserBoundaryError, match="command_denied"):
+        agent(boundary, "eval", [SUGGESTION_COUNT_JS + ";document.cookie"])
