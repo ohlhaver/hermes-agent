@@ -24,6 +24,8 @@ def _backend(counts, refs=None):
 
     def run(session, command, args, **kwargs):
         calls.append((command, args))
+        if command in ("eval", "press"):
+            assert kwargs.get("_engine_override") == "auto"
         if command == "eval":
             assert args == [SUGGESTION_COUNT_JS]
             return {"success": True, "data": {"result": counts.pop(0) if counts else 0}}
@@ -47,7 +49,7 @@ def test_names_the_matching_suggestion_and_returns_current_refs():
         "Click the matching suggestion with browser_click before you type the next field.")
     assert "[ref=e3]" in result["snapshot"]
     assert [c[0] for c in calls] == ["eval", "fill", "press", "eval", "snapshot"]
-    assert ("press", ["End"]) in calls and ("snapshot", ["-i"]) in calls
+    assert ("press", ["ArrowRight"]) in calls and ("snapshot", ["-i"]) in calls
 
 
 def test_matching_ignores_accents_and_case():
@@ -96,3 +98,10 @@ def test_failed_fill_skips_the_check():
         result = json.loads(browser_type("@e5", "8700", task_id="t"))
     assert result["success"] is False
     assert calls == ["eval", "fill"]
+
+
+def test_odd_ref_keys_still_return_the_snapshot():
+    run, _ = _backend([0, 1], {"f1e2": {"role": "listitem", "name": "8700 Küsnacht ZH"}})
+    with patch("tools.browser_tool._run_browser_command", side_effect=run):
+        result = json.loads(browser_type("@e5", "8700", task_id="t"))
+    assert "snapshot" in result

@@ -3419,17 +3419,20 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
 # HPD-1901: address and search fields often keep only a value picked from
 # their suggestion list (dieci.ch emptied PLZ/Ort/Strasse on blur). The list
 # opens on a key press, which agent-browser's fill never sends, and a compact
-# snapshot shows its entries without refs. So after typing: press End, count
+# snapshot shows its entries without refs. So after typing: press ArrowRight
+# (the caret is already at the end; End would highlight the last option in
+# MUI/Headless UI/react-select lists, and a later Enter would pick it), count
 # the visible entries with a fixed query, and only when new ones appeared take
 # an interactive snapshot and name the matching entries.
-_SUGGESTION_WAITS = (0.6, 0.6, 0.6)
+_SUGGESTION_WAITS = (0.5, 0.5)
 _SUGGESTION_ROLES = {"listitem", "option", "menuitem", "treeitem", "gridcell"}
 _SUGGESTION_MAX = 8
 
 
 def _suggestion_count(session_key: str) -> int:
     from tools.isolated_browser import SUGGESTION_COUNT_JS
-    probe = _run_browser_command(session_key, "eval", [SUGGESTION_COUNT_JS])
+    # No Lightpanda->Chrome fallback: a fresh Chrome would count another page.
+    probe = _run_browser_command(session_key, "eval", [SUGGESTION_COUNT_JS], _engine_override="auto")
     if not probe.get("success"):
         return 0
     value = (probe.get("data") or {}).get("result")
@@ -3463,7 +3466,8 @@ def _matching_suggestions(snapshot: str, refs: Dict[str, Any], text: str) -> Lis
         role, name = entries.get(ref.lstrip("@"), ("", ""))
         entries[ref.lstrip("@")] = (role or str(info.get("role") or ""), name or str(info.get("name") or ""))
     found, seen = [], set()
-    for ref, (role, name) in sorted(entries.items(), key=lambda item: int(item[0][1:] or 0)):
+    order = lambda item: (0, int(item[0][1:])) if re.fullmatch(r"e\d+", item[0]) else (1, 0)
+    for ref, (role, name) in sorted(entries.items(), key=order):
         name = name.strip()
         if role not in _SUGGESTION_ROLES or not name or name in seen:
             continue
@@ -3476,7 +3480,7 @@ def _matching_suggestions(snapshot: str, refs: Dict[str, Any], text: str) -> Lis
 def _suggestions_after_typing(session_key: str, text: str, before: int):
     """Return (notice, snapshot); snapshot is set whenever refs were renumbered."""
     try:
-        if not _run_browser_command(session_key, "press", ["End"]).get("success"):
+        if not _run_browser_command(session_key, "press", ["ArrowRight"], _engine_override="auto").get("success"):
             return None, None
         count = 0
         for wait in _SUGGESTION_WAITS:
@@ -3492,7 +3496,12 @@ def _suggestions_after_typing(session_key: str, text: str, before: int):
         data = snap.get("data") or {}
         raw = data.get("snapshot", "")
         snapshot = _redact_browser_output(_truncate_snapshot(raw))
-        items = _matching_suggestions(raw, data.get("refs") or {}, text)
+        try:
+            items = _matching_suggestions(raw, data.get("refs") or {}, text)
+        except Exception as e:
+            # The refs were renumbered; the snapshot must reach the model anyway.
+            logger.debug("Suggestion matching failed: %s", e)
+            items = []
         if not items:
             return None, snapshot
         listed = ", ".join(f'"{name}" (@{ref})' for ref, name in items)
