@@ -46,8 +46,8 @@ def test_browser_type_keeps_normal_text_in_output(monkeypatch):
 
     assert result["success"] is True
     assert result["typed"] == text
-    mock_run.assert_called_once()
-    assert mock_run.call_args.args[2] == ["@search", text]
+    fills = [c for c in mock_run.call_args_list if c.args[1] == "fill"]
+    assert len(fills) == 1 and fills[0].args[2] == ["@search", text]
 
 
 def test_browser_type_failure_redacts_api_key_in_error(monkeypatch):

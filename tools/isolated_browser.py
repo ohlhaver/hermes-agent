@@ -41,6 +41,13 @@ class BrowserBoundaryError(RuntimeError):
 
 CARD_FILL_KEYS = frozenset({"number", "expiry", "expiry_long", "cvc", "name"})
 
+# HPD-1901: browser_type asks how many suggestion entries are visible (a fixed
+# query; it answers a number only, never page text or field values).
+SUGGESTION_COUNT_JS = (
+    "(()=>[...document.querySelectorAll('.ui-autocomplete li,[role=listbox] [role=option],.pac-item')]"
+    ".filter(e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden').length)()"
+)
+
 
 class IsolatedBrowserBoundary:
     """One broker process/profile/browser per product-bound session.
@@ -147,7 +154,7 @@ class IsolatedBrowserBoundary:
                 # DevTools keyboard shortcuts can reveal past human input.
                 # Agent-browser's structured navigation/snapshot/actions keep
                 # working; the two internal URL/title reads are fixed queries.
-                if command == "eval" and args not in (["window.location.href"], ["document.title"]):
+                if command == "eval" and args not in (["window.location.href"], ["document.title"], [SUGGESTION_COUNT_JS]):
                     raise BrowserBoundaryError("command_denied")
                 if command == "get" and (len(args) != 1 or args[0] not in {"url", "title"}):
                     raise BrowserBoundaryError("command_denied")

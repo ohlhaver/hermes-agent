@@ -3416,6 +3416,106 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
+# HPD-1901: address and search fields often keep only a value picked from
+# their suggestion list (dieci.ch emptied PLZ/Ort/Strasse on blur). The list
+# opens on a key press, which agent-browser's fill never sends, and a compact
+# snapshot shows its entries without refs. So after typing: press ArrowRight
+# (the caret is already at the end; End would highlight the last option in
+# MUI/Headless UI/react-select lists, and a later Enter would pick it), count
+# the visible entries with a fixed query, and only when new ones appeared take
+# an interactive snapshot and name the matching entries.
+_SUGGESTION_WAITS = (0.5, 0.5)
+_SUGGESTION_ROLES = {"listitem", "option", "menuitem", "treeitem", "gridcell"}
+_SUGGESTION_MAX = 8
+
+
+def _suggestion_count(session_key: str) -> int:
+    from tools.isolated_browser import SUGGESTION_COUNT_JS
+    # No Lightpanda->Chrome fallback: a fresh Chrome would count another page.
+    probe = _run_browser_command(session_key, "eval", [SUGGESTION_COUNT_JS], _engine_override="auto")
+    if not probe.get("success"):
+        return 0
+    value = (probe.get("data") or {}).get("result")
+    try:
+        return int(str(value).strip().strip('"'))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fold(value: str) -> str:
+    import unicodedata
+    value = unicodedata.normalize("NFKD", str(value))
+    return "".join(c for c in value if not unicodedata.combining(c)).casefold()
+
+
+_SNAPSHOT_LINE = re.compile(r'^\s*- (\w+) "((?:[^"\\]|\\.)*)"[^\n]*?\bref=(e\d+)', re.M)
+
+
+def _matching_suggestions(snapshot: str, refs: Dict[str, Any], text: str) -> List[Tuple[str, str]]:
+    """Suggestion entries whose name contains the first typed word.
+
+    agent-browser leaves the refs name empty for cursor-clickable entries
+    (dieci's jQuery UI list), so names come from the snapshot text first.
+    """
+    words = [w for w in _fold(text).split() if len(w) >= 2]
+    if not words:
+        return []
+    entries = {ref: (role, name) for role, name, ref in _SNAPSHOT_LINE.findall(snapshot or "")}
+    for ref, info in (refs or {}).items():
+        info = info if isinstance(info, dict) else {}
+        role, name = entries.get(ref.lstrip("@"), ("", ""))
+        entries[ref.lstrip("@")] = (role or str(info.get("role") or ""), name or str(info.get("name") or ""))
+    found, seen = [], set()
+    order = lambda item: (0, int(item[0][1:])) if re.fullmatch(r"e\d+", item[0]) else (1, 0)
+    for ref, (role, name) in sorted(entries.items(), key=order):
+        name = name.strip()
+        if role not in _SUGGESTION_ROLES or not name or name in seen:
+            continue
+        if words[0] in _fold(name):
+            seen.add(name)
+            found.append((ref, name))
+    return found[:_SUGGESTION_MAX]
+
+
+def _suggestions_after_typing(session_key: str, text: str, before: int):
+    """Return (notice, snapshot); snapshot is set whenever refs were renumbered."""
+    try:
+        if not _run_browser_command(session_key, "press", ["ArrowRight"], _engine_override="auto").get("success"):
+            return None, None
+        count = 0
+        for wait in _SUGGESTION_WAITS:
+            time.sleep(wait)
+            count = _suggestion_count(session_key)
+            if count > before:
+                break
+        if count <= before:
+            return None, None
+        snap = _run_browser_command(session_key, "snapshot", ["-i"])
+        if not snap.get("success"):
+            return None, None
+        data = snap.get("data") or {}
+        raw = data.get("snapshot", "")
+        snapshot = _redact_browser_output(_truncate_snapshot(raw))
+        try:
+            items = _matching_suggestions(raw, data.get("refs") or {}, text)
+        except Exception as e:
+            # The refs were renumbered; the snapshot must reach the model anyway.
+            logger.debug("Suggestion matching failed: %s", e)
+            items = []
+        if not items:
+            return None, snapshot
+        listed = ", ".join(f'"{name}" (@{ref})' for ref, name in items)
+        notice = (
+            f"The page shows suggestions for this field: {listed}. "
+            "Many forms keep only a value picked from such a list. "
+            "Click the matching suggestion with browser_click before you type the next field."
+        )
+        return _redact_browser_output(notice), snapshot
+    except Exception as e:
+        logger.debug("Suggestion check after typing failed: %s", e)
+        return None, None
+
+
 def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """
     Type text into an input field.
@@ -3441,15 +3541,18 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     if not ref.startswith("@"):
         ref = f"@{ref}"
 
-    # Use fill command (clears then types)
-    result = _run_browser_command(effective_task_id, "fill", [ref, text])
-
     from agent.display import (
         redact_browser_typed_text_for_display,
         redact_tool_args_for_display,
     )
 
     display_text = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
+    # Secrets and empty text never get a suggestion check (HPD-1901).
+    check_suggestions = display_text == text and bool(text.strip())
+    before = _suggestion_count(effective_task_id) if check_suggestions else 0
+
+    # Use fill command (clears then types)
+    result = _run_browser_command(effective_task_id, "fill", [ref, text])
 
     if result.get("success"):
         response = {
@@ -3461,6 +3564,13 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
             "typed": display_text,
             "element": ref
         }
+        if check_suggestions:
+            notice, snapshot = _suggestions_after_typing(effective_task_id, text, before)
+            if notice:
+                response["suggestions"] = notice
+            if snapshot is not None:
+                # The check renumbered the refs; these are the current ones.
+                response["snapshot"] = snapshot
         response = _copy_fallback_warning(response, result)
         response = redact_browser_typed_text_for_display(response, text)
         return json.dumps(response, ensure_ascii=False)
