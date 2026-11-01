@@ -3346,6 +3346,15 @@ def browser_snapshot(
             "snapshot": _redact_browser_output(snapshot_text),
             "element_count": len(refs) if refs else 0
         }
+        # HPD-1901: after a click the page can be another site (dieci.ch's
+        # order button redirects to Saferpay), and a snapshot alone does not
+        # say so; the card payment approval needs that page's address. Same
+        # shape as browser_navigate's url: no query or fragment.
+        if str(data.get("origin") or "").startswith(("http://", "https://")):
+            from urllib.parse import urlsplit, urlunsplit
+            _p = urlsplit(str(data.get("origin")))
+            _host = (_p.hostname or "") + (f":{_p.port}" if _p.port else "")  # never user:password@
+            response["url"] = _redact_browser_output(urlunsplit((_p.scheme, _host, _p.path, "", "")))
         _copy_fallback_warning(response, result)
         # HPD-1798: the isolated browser's broker flags a visible consent banner.
         if ((data.get("page_info") or {}).get("consent")) is True:
@@ -3459,9 +3468,13 @@ def _set_control(session_key: str, ref: str) -> Optional[bool]:
     if was_checked and "radio" in role:
         return True
     command = "uncheck" if was_checked else "check"
-    if not _run_browser_command(session_key, command, [ref], _engine_override="auto").get("success"):
-        return None
-    return not was_checked
+    if _run_browser_command(session_key, command, [ref], _engine_override="auto").get("success"):
+        return not was_checked
+    # check may have clicked before it failed: never click on top of a change.
+    after = _run_browser_command(session_key, "is", ["checked", ref], _engine_override="auto")
+    if after.get("success") and ((after.get("data") or {}).get("checked") is True) != was_checked:
+        return not was_checked
+    return None
 
 
 # HPD-1901: address and search fields often keep only a value picked from
