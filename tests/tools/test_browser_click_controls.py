@@ -20,8 +20,9 @@ def _plain_backend(monkeypatch):
     monkeypatch.setattr(browser_tool, "_CONTROL_ROLES", {})
 
 
-def _backend(checked=False, fail=()):
+def _backend(checked=False, fail=(), checked_after=None):
     calls = []
+    reads = []
 
     def run(session, command, args, **kwargs):
         calls.append((command, args))
@@ -32,7 +33,9 @@ def _backend(checked=False, fail=()):
         if command == "snapshot":
             return {"success": True, "data": {"snapshot": "- checkbox [ref=e88]", "refs": REFS}}
         if command == "is":
-            return {"success": True, "data": {"checked": checked}}
+            reads.append(1)
+            value = checked if len(reads) == 1 or checked_after is None else checked_after
+            return {"success": True, "data": {"checked": value}}
         return {"success": True, "data": {}}
     return run, calls
 
@@ -78,3 +81,9 @@ def test_without_a_snapshot_a_ref_is_clicked():
     with patch("tools.browser_tool._run_browser_command", side_effect=run):
         assert json.loads(browser_click("@e88", task_id="t")) == {"success": True, "clicked": "@e88"}
     assert [c[0] for c in calls] == ["click"]
+
+
+def test_a_check_that_changed_the_box_before_failing_is_not_clicked_again():
+    run, calls = _backend(checked=False, fail=("check",), checked_after=True)
+    assert _click("@e88", run) == {"success": True, "clicked": "@e88", "checked": True}
+    assert not any(c[0] == "click" for c in calls)

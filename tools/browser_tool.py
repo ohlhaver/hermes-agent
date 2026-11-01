@@ -3459,9 +3459,13 @@ def _set_control(session_key: str, ref: str) -> Optional[bool]:
     if was_checked and "radio" in role:
         return True
     command = "uncheck" if was_checked else "check"
-    if not _run_browser_command(session_key, command, [ref], _engine_override="auto").get("success"):
-        return None
-    return not was_checked
+    if _run_browser_command(session_key, command, [ref], _engine_override="auto").get("success"):
+        return not was_checked
+    # check may have clicked before it failed: never click on top of a change.
+    after = _run_browser_command(session_key, "is", ["checked", ref], _engine_override="auto")
+    if after.get("success") and ((after.get("data") or {}).get("checked") is True) != was_checked:
+        return not was_checked
+    return None
 
 
 # HPD-1901: address and search fields often keep only a value picked from
