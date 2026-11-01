@@ -87,3 +87,21 @@ def test_a_check_that_changed_the_box_before_failing_is_not_clicked_again():
     run, calls = _backend(checked=False, fail=("check",), checked_after=True)
     assert _click("@e88", run) == {"success": True, "clicked": "@e88", "checked": True}
     assert not any(c[0] == "click" for c in calls)
+
+
+def test_snapshot_names_the_page_address_without_query():
+    def run(session, command, args, **kwargs):
+        return {"success": True, "data": {"snapshot": "- button [ref=e1]", "refs": {},
+                                          "origin": "https://www.saferpay.com/vt2/Api/PaymentPage/1/2?token=x#y"}}
+    with patch("tools.browser_tool._run_browser_command", side_effect=run), \
+            patch("tools.browser_tool._is_local_backend", return_value=True):
+        result = json.loads(browser_snapshot(task_id="t"))
+    assert result["url"] == "https://www.saferpay.com/vt2/Api/PaymentPage/1/2"
+
+
+def test_snapshot_address_drops_login_details():
+    def run(session, command, args, **kwargs):
+        return {"success": True, "data": {"snapshot": "", "refs": {}, "origin": "https://alice:secret@shop.example:8443/pay?x=1"}}
+    with patch("tools.browser_tool._run_browser_command", side_effect=run), \
+            patch("tools.browser_tool._is_local_backend", return_value=True):
+        assert json.loads(browser_snapshot(task_id="t"))["url"] == "https://shop.example:8443/pay"
