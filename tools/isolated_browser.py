@@ -135,14 +135,15 @@ class IsolatedBrowserBoundary:
                 # No profile/export/CDP attach, arbitrary filesystem paths,
                 # recording or cookies through the agent channel.
                 allowed = {"open", "snapshot", "click", "fill", "type", "scroll",
-                           "back", "forward", "press", "get", "eval"}
+                           "back", "forward", "press", "get", "eval", "is", "check", "uncheck"}
                 if command not in allowed or not isinstance(args, list) or any(
                     not isinstance(arg, str) for arg in args
                 ) or any(arg.startswith("--") and arg not in (
                     "--interactive", "--compact"
                 ) for arg in args):
                     raise BrowserBoundaryError("command_denied")
-                arity = {"open": 1, "click": 1, "fill": 2, "type": 1, "press": 1, "back": 0, "forward": 0}
+                arity = {"open": 1, "click": 1, "fill": 2, "type": 1, "press": 1, "back": 0, "forward": 0,
+                         "check": 1, "uncheck": 1, "is": 2}
                 if command in arity and len(args) != arity[command]:
                     raise BrowserBoundaryError("command_denied")
                 if command not in {"snapshot", "eval"} and any(arg.startswith("-") for arg in args):
@@ -158,6 +159,10 @@ class IsolatedBrowserBoundary:
                     raise BrowserBoundaryError("command_denied")
                 if command == "get" and (len(args) != 1 or args[0] not in {"url", "title"}):
                     raise BrowserBoundaryError("command_denied")
+                # HPD-1901: a checkbox/radio's checked state, already visible
+                # in a snapshot, and setting it; never a value or HTML.
+                if command == "is" and (args[0] != "checked" or not re.fullmatch(r"@?e\d+", args[1])):
+                    raise BrowserBoundaryError("command_denied")
                 if command == "snapshot" and any(arg not in {"-c", "-i", "--compact", "--interactive"} for arg in args):
                     raise BrowserBoundaryError("command_denied")
                 if command == "press" and (len(args) != 1 or args[0] not in {
@@ -165,7 +170,7 @@ class IsolatedBrowserBoundary:
                     "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"
                 }):
                     raise BrowserBoundaryError("command_denied")
-                if command in {"click", "fill"} and (not args or not re.fullmatch(r"@?e\d+", args[0])):
+                if command in {"click", "fill", "check", "uncheck"} and (not args or not re.fullmatch(r"@?e\d+", args[0])):
                     raise BrowserBoundaryError("command_denied")
                 self.active += 1
             elif method == "card.fill":
@@ -381,7 +386,7 @@ _AGENT_ERROR_TEXT = {
 }
 # Codes that mean "not ready yet": wait and retry before telling the model.
 _RETRY_CODES = {"browser_unavailable", "handoff_pending"}
-_READ_ONLY_COMMANDS = {"open", "snapshot", "get", "eval"}
+_READ_ONLY_COMMANDS = {"open", "snapshot", "get", "eval", "is"}
 RETRY_WINDOW_SECONDS = 20.0
 RETRY_INTERVAL_SECONDS = 2.0
 
