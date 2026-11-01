@@ -97,3 +97,11 @@ def test_snapshot_names_the_page_address_without_query():
             patch("tools.browser_tool._is_local_backend", return_value=True):
         result = json.loads(browser_snapshot(task_id="t"))
     assert result["url"] == "https://www.saferpay.com/vt2/Api/PaymentPage/1/2"
+
+
+def test_snapshot_address_drops_login_details():
+    def run(session, command, args, **kwargs):
+        return {"success": True, "data": {"snapshot": "", "refs": {}, "origin": "https://alice:secret@shop.example:8443/pay?x=1"}}
+    with patch("tools.browser_tool._run_browser_command", side_effect=run), \
+            patch("tools.browser_tool._is_local_backend", return_value=True):
+        assert json.loads(browser_snapshot(task_id="t"))["url"] == "https://shop.example:8443/pay"

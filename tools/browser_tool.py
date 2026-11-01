@@ -3353,7 +3353,8 @@ def browser_snapshot(
         if str(data.get("origin") or "").startswith(("http://", "https://")):
             from urllib.parse import urlsplit, urlunsplit
             _p = urlsplit(str(data.get("origin")))
-            response["url"] = _redact_browser_output(urlunsplit((_p.scheme, _p.netloc, _p.path, "", "")))
+            _host = (_p.hostname or "") + (f":{_p.port}" if _p.port else "")  # never user:password@
+            response["url"] = _redact_browser_output(urlunsplit((_p.scheme, _host, _p.path, "", "")))
         _copy_fallback_warning(response, result)
         # HPD-1798: the isolated browser's broker flags a visible consent banner.
         if ((data.get("page_info") or {}).get("consent")) is True:
