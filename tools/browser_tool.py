@@ -2998,6 +2998,7 @@ def _settle_isolated_snapshot(session_key, snap_result, title, final_url, respon
         time.sleep(_ISOLATED_SETTLE_SECONDS)
         looks += 1
         again = _run_browser_command(session_key, "snapshot", ["-c"])
+        _remember_roles(session_key, again)
         if not again.get("success"):
             break
         snap_result = again
@@ -3240,6 +3241,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # without a separate browser_snapshot call.
         try:
             snap_result = _run_browser_command(nav_session_key, "snapshot", ["-c"])
+            _remember_roles(nav_session_key, snap_result)
             if _isolated_browser_binding() is not None and snap_result.get("success"):
                 snap_result = _settle_isolated_snapshot(
                     nav_session_key, snap_result, title, final_url, response)
@@ -3295,6 +3297,7 @@ def browser_snapshot(
         args.extend(["-c"])  # Compact mode
 
     result = _run_browser_command(effective_task_id, "snapshot", args)
+    _remember_roles(effective_task_id, result)
 
     if result.get("success"):
         data = result.get("data", {})
@@ -3400,6 +3403,10 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     if not ref.startswith("@"):
         ref = f"@{ref}"
 
+    checked = _set_control(effective_task_id, ref)
+    if checked is not None:
+        return json.dumps({"success": True, "clicked": ref, "checked": checked}, ensure_ascii=False)
+
     result = _run_browser_command(effective_task_id, "click", [ref])
 
     if result.get("success"):
@@ -3414,6 +3421,47 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
             "error": result.get("error", f"Failed to click {ref}")
         }
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+# HPD-1901: shops draw their own checkboxes and radio buttons and hide the
+# real input (dieci.ch: the payment radios are display:none, the terms
+# checkbox sits outside the viewport, and the middle of its label is the link
+# to the terms page). A click on such a ref lands nowhere or on that link, so
+# the order button then does nothing. A ref the last snapshot named a checkbox
+# or radio is set with agent-browser's check/uncheck instead, which acts on
+# the control itself. Refs stay the same across snapshots of one page; a role
+# that no longer fits makes check fail, and the plain click runs as before.
+_CONTROL_ROLES: Dict[str, Dict[str, str]] = {}
+_CONTROL_ROLE_NAMES = {"checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"}
+
+
+def _remember_roles(session_key: str, result: Dict[str, Any]) -> None:
+    refs = (result.get("data") or {}).get("refs") if result.get("success") else None
+    if not isinstance(refs, dict):
+        return
+    _CONTROL_ROLES[session_key] = {
+        str(key): str(value.get("role"))
+        for key, value in refs.items()
+        if isinstance(value, dict) and value.get("role") in _CONTROL_ROLE_NAMES
+    }
+
+
+def _set_control(session_key: str, ref: str) -> Optional[bool]:
+    """Toggle a checkbox or select a radio; None when ref is neither or it fails."""
+    role = _CONTROL_ROLES.get(session_key, {}).get(ref.lstrip("@"))
+    if role is None:
+        return None
+    # No Lightpanda->Chrome fallback: a fresh Chrome would see another page.
+    state = _run_browser_command(session_key, "is", ["checked", ref], _engine_override="auto")
+    if not state.get("success"):
+        return None
+    was_checked = (state.get("data") or {}).get("checked") is True
+    if was_checked and "radio" in role:
+        return True
+    command = "uncheck" if was_checked else "check"
+    if not _run_browser_command(session_key, command, [ref], _engine_override="auto").get("success"):
+        return None
+    return not was_checked
 
 
 # HPD-1901: address and search fields often keep only a value picked from
@@ -3491,6 +3539,7 @@ def _suggestions_after_typing(session_key: str, text: str, before: int):
         if count <= before:
             return None, None
         snap = _run_browser_command(session_key, "snapshot", ["-i"])
+        _remember_roles(session_key, snap)
         if not snap.get("success"):
             return None, None
         data = snap.get("data") or {}

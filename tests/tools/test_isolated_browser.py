@@ -282,3 +282,13 @@ def test_broker_allows_only_the_fixed_suggestion_count_query(boundary):
     assert agent(boundary, "press", ["End"])["success"]
     with pytest.raises(BrowserBoundaryError, match="command_denied"):
         agent(boundary, "eval", [SUGGESTION_COUNT_JS + ";document.cookie"])
+
+
+def test_broker_allows_check_uncheck_and_checked_state_of_a_ref_only(boundary):
+    # HPD-1901: browser_click sets checkboxes and radios through check/uncheck.
+    for command, args in (("check", ["@e88"]), ("uncheck", ["e88"]), ("is", ["checked", "@e88"])):
+        assert agent(boundary, command, args)["success"]
+    for command, args in (("check", ["#agb"]), ("check", ["@e88", "@e89"]), ("is", ["visible", "@e88"]),
+                          ("is", ["checked", "input"]), ("get", ["attr", "@e88", "value"])):
+        with pytest.raises(BrowserBoundaryError, match="command_denied"):
+            agent(boundary, command, args)
