@@ -181,3 +181,56 @@ def test_long_response_is_not_treated_as_an_ack():
     assert not looks_like_codex_intermediate_ack(
         a, REPRO_USER, long_ack, msgs, require_workspace=False
     )
+
+
+
+# HPD-1902: Hey Hermes' Home chat, German, long history with earlier tools.
+def test_german_announcement_in_a_long_chat_fires_when_opted_in():
+    a = _agent(True, "chat_completions")
+    user = "Ich wuerde gerne Sushi bestellen, das hier um 19:30 Uhr ankommt."
+    ack = "Die Option bleibt Sushi Dou. Ich prüfe kurz, ob heute Abend geliefert wird und 19:30 machbar ist."
+    msgs = [
+        {"role": "user", "content": "earlier"},
+        {"role": "tool", "content": "earlier result"},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "user", "content": user},
+    ]
+    assert looks_like_codex_intermediate_ack(a, user, ack, msgs, require_workspace=False)
+
+
+def test_a_tool_in_this_turn_still_stops_it_and_a_nudge_does_not_start_a_new_turn():
+    a = _agent(True, "chat_completions")
+    ack = "Ich schaue gleich nach und melde mich."
+    msgs = [{"role": "user", "content": "Und?"}, {"role": "tool", "content": "result"},
+            {"role": "user", "content": "[System: Continue now. Execute the required tool calls.]"}]
+    assert not looks_like_codex_intermediate_ack(a, "Und?", ack, msgs, require_workspace=False)
+
+
+def test_plain_german_answer_does_not_fire():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "Und?"}]
+    assert not looks_like_codex_intermediate_ack(
+        a, "Und?", "Heute ist Sushi Dou geschlossen. Soll ich einen anderen Anbieter suchen?", msgs,
+        require_workspace=False)
+
+
+
+def test_german_answers_that_only_sound_like_announcements_do_not_fire():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "Danke"}]
+    for text in ("Ich melde mich, sobald Sushi Dou bestätigt.",
+                 "Lass mich wissen, ob ich weiter suchen soll.",
+                 "Ich sehe, dass der Checkout geklappt hat.",
+                 "Ich frage mich, ob du das Restaurant besuchen willst.",
+                 "Einen Moment noch, ich melde mich."):
+        assert not looks_like_codex_intermediate_ack(a, "Danke", text, msgs, require_workspace=False), text
+
+
+def test_a_tool_before_the_empty_recovery_nudge_still_counts_for_this_turn():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "Bestell bitte"},
+            {"role": "tool", "content": "result"},
+            {"role": "user", "content": "You just executed tool calls but returned an empty response.",
+             "_empty_recovery_synthetic": True}]
+    assert not looks_like_codex_intermediate_ack(
+        a, "Bestell bitte", "Ich prüfe kurz noch die Lieferzeit.", msgs, require_workspace=False)
