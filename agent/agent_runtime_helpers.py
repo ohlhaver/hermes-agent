@@ -2895,7 +2895,18 @@ def looks_like_codex_intermediate_ack(
     always apply, which is what keeps conversational "I'll help you brainstorm"
     replies from tripping it.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    # Only this turn counts: in a long-lived gateway chat (Hey Hermes' one Home
+    # conversation) the history always holds earlier tool results, and the
+    # guard never fired (HPD-1902). The turn starts after the last user message
+    # that is not one of the loop's own continuation nudges.
+    turn = list(messages or [])
+    for index in range(len(turn) - 1, -1, -1):
+        msg = turn[index]
+        if (isinstance(msg, dict) and msg.get("role") == "user"
+                and not str(msg.get("content") or "").startswith("[System:")):
+            turn = turn[index + 1:]
+            break
+    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in turn):
         return False
 
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
@@ -2906,6 +2917,11 @@ def looks_like_codex_intermediate_ack(
 
     has_future_ack = bool(
         re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        # German first person, present tense for the near future (HPD-1902:
+        # "Ich prüfe kurz, ob heute Abend geliefert wird", then nothing).
+        or re.search(r"\b(ich (prüfe|pruefe|schaue|suche|kläre|klaere|checke|teste|sehe|"
+                     r"recherchiere|starte|frage|kümmere|kuemmere|melde mich)|lass mich|einen moment)\b",
+                     assistant_text)
     )
     if not has_future_ack:
         return False
@@ -2930,6 +2946,19 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        # German (HPD-1902)
+        "prüf",
+        "pruef",
+        "schau",
+        "such",
+        "kläre",
+        "klaere",
+        "check",
+        "nachseh",
+        "sehe nach",
+        "recherch",
+        "frage nach",
+        "melde mich",
     )
     workspace_markers = (
         "directory",
