@@ -2895,7 +2895,19 @@ def looks_like_codex_intermediate_ack(
     always apply, which is what keeps conversational "I'll help you brainstorm"
     replies from tripping it.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    # Only this turn counts: in a long-lived gateway chat (Hey Hermes' one Home
+    # conversation) the history always holds earlier tool results, and the
+    # guard never fired (HPD-1902). The turn starts after the last user message
+    # that is not one of the loop's own continuation nudges.
+    turn = list(messages or [])
+    for index in range(len(turn) - 1, -1, -1):
+        msg = turn[index]
+        if (isinstance(msg, dict) and msg.get("role") == "user"
+                and not str(msg.get("content") or "").startswith("[System:")
+                and not any(str(key).endswith("_synthetic") and msg.get(key) for key in msg)):
+            turn = turn[index + 1:]
+            break
+    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in turn):
         return False
 
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
@@ -2904,7 +2916,17 @@ def looks_like_codex_intermediate_ack(
     if len(assistant_text) > 1200:
         return False
 
-    has_future_ack = bool(
+    # German first person, present tense for the near future, with the work
+    # verb itself (HPD-1902: "Ich prüfe kurz, ob heute Abend geliefert wird",
+    # then nothing). Phrases like "lass mich wissen", "ich melde mich, sobald",
+    # "ich sehe, dass" or "ich frage mich" are answers, not announcements.
+    german_ack = bool(re.search(
+        r"\bich (?:prüfe|pruefe|schaue|suche|kläre|klaere|checke|recherchiere|kümmere mich|kuemmere mich"
+        r"|sehe (?:kurz |gleich |mal )?nach|frage (?:kurz |gleich )?nach)\b"
+        r"|\blass mich (?:kurz |mal )?(?:prüfen|pruefen|schauen|nachsehen|nachschauen|suchen|checken|klären|klaeren)\b",
+        assistant_text,
+    ))
+    has_future_ack = german_ack or bool(
         re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
     )
     if not has_future_ack:
@@ -2947,7 +2969,7 @@ def looks_like_codex_intermediate_ack(
         "path",
     )
 
-    assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
+    assistant_mentions_action = german_ack or any(marker in assistant_text for marker in action_markers)
     if not assistant_mentions_action:
         return False
 
