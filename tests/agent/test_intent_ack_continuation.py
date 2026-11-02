@@ -212,3 +212,25 @@ def test_plain_german_answer_does_not_fire():
     assert not looks_like_codex_intermediate_ack(
         a, "Und?", "Heute ist Sushi Dou geschlossen. Soll ich einen anderen Anbieter suchen?", msgs,
         require_workspace=False)
+
+
+
+def test_german_answers_that_only_sound_like_announcements_do_not_fire():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "Danke"}]
+    for text in ("Ich melde mich, sobald Sushi Dou bestätigt.",
+                 "Lass mich wissen, ob ich weiter suchen soll.",
+                 "Ich sehe, dass der Checkout geklappt hat.",
+                 "Ich frage mich, ob du das Restaurant besuchen willst.",
+                 "Einen Moment noch, ich melde mich."):
+        assert not looks_like_codex_intermediate_ack(a, "Danke", text, msgs, require_workspace=False), text
+
+
+def test_a_tool_before_the_empty_recovery_nudge_still_counts_for_this_turn():
+    a = _agent(True, "chat_completions")
+    msgs = [{"role": "user", "content": "Bestell bitte"},
+            {"role": "tool", "content": "result"},
+            {"role": "user", "content": "You just executed tool calls but returned an empty response.",
+             "_empty_recovery_synthetic": True}]
+    assert not looks_like_codex_intermediate_ack(
+        a, "Bestell bitte", "Ich prüfe kurz noch die Lieferzeit.", msgs, require_workspace=False)
